@@ -1,0 +1,3361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lush Cave</title>
+<meta name="description" content="A cave platformer: find the black door in each cave. Keyboard controls.">
+<style>
+  /* base rules the Claude artifact viewer normally supplies */
+  :root{color-scheme:light}
+  img{max-width:100%}
+  [hidden]:not([hidden=until-found]){display:none!important}
+
+  html, body { height: 100%; margin: 0; background: #000; overflow: hidden; }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    object-fit: contain;
+    image-rendering: pixelated;
+    background: #000;
+    outline: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+<script>
+'use strict';
+
+// =============================================================
+// CONFIG — every tunable in one place
+// =============================================================
+const CFG = {
+  // world
+  W: 200, H: 200, TILE: 16,
+  VIEW_W: 960, VIEW_H: 540,
+
+  // cellular automata
+  fillProb: 0.45, edgeBias: 0.25, edgeDist: 12, caIters: 5,
+  minRegionTunnel: 80,
+
+  // water
+  poolTarget: 12, poolMinRow: 80,
+
+  // flora densities (percent chances)
+  mushroomChance: 0.12, vineChance: 0.15, glowMossPct: 8, dripPct: 3,
+  bigvineChance: 0.05, stickyRunChance: 0.35,
+
+  // traversal
+  climbSpeed: 95, wallSlide: 45, wallJumpVx: 130, wallJumpVy: -300, wallCoyote: 0.12,
+  wallJumpLock: 0.25, // jump-cut immunity after a wall jump, so taps still climb
+
+  // entrance hints + placement (distance in blocks, manhattan)
+  hintRadius: 40, doorMinDist: 100, doorMaxDist: 120,
+
+  // lighting (0..15 tile light)
+  lightMushroom: 12, lightMoss: 9, lightVine: 9, lightWater: 4,
+  playerLight: 14, playerLightFalloff: 1.25, darknessExp: 1.4, darknessMax: 244,
+
+  // player physics (px, px/s)
+  playerW: 12, playerH: 22,
+  gravity: 1500, riseGravity: 850, maxFall: 420, accel: 1800, airAccel: 1000,
+  maxRun: 150, friction: 1400, jumpVy: -275, jumpCut: 0.5,
+  coyoteTime: 0.10, jumpBuffer: 0.12,
+  // water physics
+  waterGravity: 350, waterMaxFall: 60, waterAccel: 700, waterMaxRun: 90,
+  waterFriction: 500, swimThrust: -110, swimAccel: 900, surfaceLeap: -260,
+
+  // particles
+  maxParticles: 450, sporeChance: 0.015,
+
+  // lava
+  lavaMaxTime: 2.0,
+
+  // dash: 3 blocks in a burst, half-second cooldown
+  dashSpeed: 400, dashTime: 0.12, dashCooldown: 0.5,
+
+  // bouncy mushrooms
+  trampolineVy: -540, trampolineChance: 0.07,
+
+  // crabs
+  crabCount: 50, crabSpeed: 35, crabBounce: -230, crabStompPad: 4,
+
+  // grasshoppers
+  hopperCount: 20, hopperJumpVy: -230,
+};
+
+const W = CFG.W, H = CFG.H, T = CFG.TILE;
+const AIR = 0, STONE = 1, WATER = 2;
+
+// =============================================================
+// RNG + hashing
+// =============================================================
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function hash2(x, y, seed) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263)) ^ seed;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function lerpColor(a, b, t) {
+  const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16);
+  const r = ((pa >> 16) + (((pb >> 16) - (pa >> 16)) * t)) | 0;
+  const g = (((pa >> 8) & 255) + ((((pb >> 8) & 255) - ((pa >> 8) & 255)) * t)) | 0;
+  const bl = ((pa & 255) + (((pb & 255) - (pa & 255)) * t)) | 0;
+  return `rgb(${r},${g},${bl})`;
+}
+
+// =============================================================
+// WORLD STATE
+// =============================================================
+let world = null; // { seed, tiles, staticLight, floraByCol, waterSurf, dripPoints, spawn, terrainCanvas }
+
+function tileAt(tx, ty) {
+  if (tx < 0 || tx >= W || ty < 0 || ty >= H) return STONE;
+  return world.tiles[ty * W + tx];
+}
+function isSolid(tx, ty) { return tileAt(tx, ty) === STONE; }
+function maskAt(mask, tx, ty) {
+  if (tx < 0 || tx >= W || ty < 0 || ty >= H) return 0;
+  return mask[ty * W + tx];
+}
+
+// =============================================================
+// REACHABILITY — conservative movement-model BFS from spawn.
+// Moves modeled: walk, step/jump up to 2 tiles, fall, swim,
+// climb big vines, ascend sticky walls. Under-approximates real
+// movement, so anything it reaches is truly reachable in play.
+// =============================================================
+function makeMoveModel(tiles, climbMask, stickyMask, hazardMask) {
+  const open = (x, y) => tiles[y * W + x] !== STONE;
+  const validPos = (x, y) => x >= 0 && x < W && y >= 1 && y < H && open(x, y) && open(x, y - 1) &&
+    (!hazardMask || !hazardMask[y * W + x]);
+  const isWater = (x, y) => tiles[y * W + x] === WATER;
+  const climbAt = (x, y) => climbMask[y * W + x] || climbMask[(y - 1) * W + x];
+  const stickyAdj = (x, y) => {
+    for (const dy of [0, -1]) for (const dx of [-1, 1]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx >= 0 && nx < W && ny >= 0 && ny < H &&
+          tiles[ny * W + nx] === STONE && stickyMask[ny * W + nx]) return true;
+    }
+    return false;
+  };
+  const supported = (x, y) =>
+    (y + 1 < H && tiles[(y + 1) * W + x] === STONE) ||
+    climbAt(x, y) || isWater(x, y) || stickyAdj(x, y);
+
+  // all moves from (x,y); generous widens jumps to over-estimate player ability
+  const movesFrom = (x, y, out, generous) => {
+    out.length = 0;
+    const add = (nx, ny) => { if (validPos(nx, ny)) out.push(ny * W + nx); };
+    if (isWater(x, y)) { // swim freely; leap out at the surface
+      add(x - 1, y); add(x + 1, y); add(x, y - 1); add(x, y + 1);
+      if (y > 0 && tiles[(y - 1) * W + x] === AIR)
+        for (const dx of [-1, 0, 1]) add(x + dx, y - 1);
+      return;
+    }
+    if (!supported(x, y)) { // falling, with air control: down and diagonal drift
+      add(x, y + 1); add(x - 1, y + 1); add(x + 1, y + 1);
+      return;
+    }
+    for (const dx of [-1, 1]) {
+      add(x + dx, y);                                     // walk (or step off into a fall)
+      add(x + dx, y - 1);                                 // step up 1
+      if (validPos(x, y - 2)) add(x + dx, y - 2);         // jump up 2 onto a ledge
+    }
+    // running jumps across gaps, through a clear 2-tall corridor
+    const range = generous ? 5 : 3;
+    for (const dir of [-1, 1]) {
+      for (let k = 1; k <= range; k++) {
+        const jx = x + dir * k;
+        if (jx < 1 || jx >= W - 1 || !open(jx, y - 1) || !open(jx, y - 2)) break;
+        if (k >= 2) add(jx, y - 1);
+      }
+    }
+    if (climbAt(x, y)) { add(x, y - 1); add(x, y + 1); }  // climb the vine
+    if (stickyAdj(x, y) && stickyAdj(x, y - 1)) add(x, y - 1); // wall-jump up the wall
+  };
+
+  return { open, validPos, isWater, supported, movesFrom };
+}
+
+// forward reach from spawn. generous=false under-approximates real movement
+// (anything reached is truly reachable); generous=true over-approximates where
+// a skilled player might end up, for trap detection.
+function computeReach(tiles, climbMask, stickyMask, spawnTile, generous, hazardMask) {
+  const M = makeMoveModel(tiles, climbMask, stickyMask, hazardMask);
+  const reach = new Uint8Array(W * H);
+  const q = [];
+  const start = spawnTile.y * W + spawnTile.x;
+  reach[start] = 1; q.push(start);
+  const out = [];
+  let head = 0;
+  while (head < q.length) {
+    const i = q[head++];
+    M.movesFrom(i % W, (i / W) | 0, out, generous);
+    for (const d of out) if (!reach[d]) { reach[d] = 1; q.push(d); }
+  }
+  return reach;
+}
+
+// positions that can get BACK to spawn (reverse BFS over the movement graph).
+// Pass the same `generous` used for the matching forward pass — trap detection
+// must judge entry and escape with the same skill level.
+function computeReturnMulti(tiles, climbMask, stickyMask, anchors, generous) {
+  const M = makeMoveModel(tiles, climbMask, stickyMask);
+  const head = new Int32Array(W * H).fill(-1); // reverse adjacency as linked lists
+  const nxt = [], src = [];
+  const out = [];
+  for (let y = 1; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (!M.validPos(x, y)) continue;
+      M.movesFrom(x, y, out, generous);
+      const i = y * W + x;
+      for (const d of out) { src.push(i); nxt.push(head[d]); head[d] = src.length - 1; }
+    }
+  }
+  return anchors.map(a => {
+    const can = new Uint8Array(W * H);
+    const q = [a.y * W + a.x];
+    can[q[0]] = 1;
+    let h = 0;
+    while (h < q.length) {
+      const d = q[h++];
+      for (let e = head[d]; e !== -1; e = nxt[e]) {
+        const s = src[e];
+        if (!can[s]) { can[s] = 1; q.push(s); }
+      }
+    }
+    return can;
+  });
+}
+
+function computeReturn(tiles, climbMask, stickyMask, spawnTile, generous) {
+  return computeReturnMulti(tiles, climbMask, stickyMask, [spawnTile], generous)[0];
+}
+
+// =============================================================
+// WORLD GENERATION
+// =============================================================
+// static lighting: BFS from emitters, cost 1 through air/water, 2 through stone
+function computeStaticLight(tiles, emitters) {
+  const staticLight = new Uint8Array(W * H);
+  const q = [];
+  let head = 0;
+  for (const e of emitters) {
+    const i = e.y * W + e.x;
+    if (e.s > staticLight[i]) { staticLight[i] = e.s; q.push(i); }
+  }
+  while (head < q.length) {
+    const i = q[head++];
+    const l = staticLight[i];
+    const x = i % W, y = (i / W) | 0;
+    const nbs = [i - 1, i + 1, i - W, i + W];
+    const ok = [x > 0, x < W - 1, y > 0, y < H - 1];
+    for (let k = 0; k < 4; k++) {
+      if (!ok[k]) continue;
+      const ni = nbs[k];
+      const nl = l - (tiles[ni] === STONE ? 2 : 1);
+      if (nl > staticLight[ni]) { staticLight[ni] = nl; q.push(ni); }
+    }
+  }
+  return staticLight;
+}
+
+// crabs: floor patrollers on reachable 2-wide floors, away from spawn and doors
+function placeCrabs(tiles, reach, spawnTile, doors, rng) {
+  const crabs = [];
+  const spots = [];
+  for (let y = 4; y < H - 4; y++) {
+    for (let x = 3; x < W - 4; x++) {
+      const i = y * W + x;
+      if (tiles[i] !== AIR || tiles[i + W] !== STONE) continue;
+      if (tiles[i + 1] !== AIR || tiles[i + 1 + W] !== STONE) continue;
+      if (!reach[i]) continue;
+      if (Math.abs(x - spawnTile.x) + Math.abs(y - spawnTile.y) < 18) continue;
+      if (doors.some(d => Math.abs(x - d.x) < 6 && Math.abs(y - d.y) < 5)) continue;
+      spots.push({ x, y });
+    }
+  }
+  for (let n = 0; n < (PAL.crabCount ?? CFG.crabCount) && spots.length; n++) {
+    const s = spots.splice((rng() * spots.length) | 0, 1)[0];
+    crabs.push({ x: s.x * T + 1, y: (s.y + 1) * T - 10, dir: rng() < 0.5 ? -1 : 1, squash: 0, dead: false });
+  }
+  return crabs;
+}
+
+// The Temple (level 4): a hand-built stone-brick gauntlet — flat runs, lava
+// gaps, stairs and drops — ending at the sand door into the Unknown Desert.
+// Every hop is <=2 up / <=3 across by construction, so it stays traversable.
+function generateTempleWorld(seed, level = 4) {
+  const rng = mulberry32(seed);
+  const tiles = new Uint8Array(W * H).fill(STONE);
+  const emitters = [];
+  const carve = (cx, fy) => {
+    for (let dy = 1; dy <= 6; dy++) tiles[(fy - dy) * W + cx] = AIR;
+  };
+  let x = 4, y = 100;
+  for (; x < 12; x++) carve(x, y); // entry hall
+  const spawnTile = { x: 6, y: y - 1 };
+  let guard = 0;
+  let xc = 12;
+  while (xc < 172 && guard++ < 300) {
+    const roll = rng();
+    if (roll < 0.42) { // flat run
+      const len = 5 + ((rng() * 5) | 0);
+      for (let k = 0; k < len && xc < 174; k++, xc++) carve(xc, y);
+    } else if (roll < 0.60) { // lava gap, mostly 2 wide
+      const len = 2 + (rng() < 0.3 ? 1 : 0);
+      for (let k = 0; k < len && xc < 174; k++, xc++) {
+        carve(xc, y);
+        tiles[y * W + xc] = WATER;
+        tiles[(y + 1) * W + xc] = WATER;
+      }
+      carve(xc, y); carve(xc + 1, y); xc += 2; // roomy landing ledge
+    } else if (roll < 0.82 && y > 48) { // stairs up
+      const steps = 1 + ((rng() * 2) | 0);
+      for (let s = 0; s < steps && xc < 174 && y > 48; s++) {
+        y -= 2;
+        carve(xc, y); carve(xc + 1, y);
+        xc += 2;
+      }
+    } else if (y < 146) { // drop down
+      const steps = 1 + ((rng() * 2) | 0);
+      for (let s = 0; s < steps && xc < 174 && y < 146; s++) {
+        y += 2;
+        carve(xc, y); carve(xc + 1, y);
+        xc += 2;
+      }
+    }
+    emitters.push({ x: Math.min(xc, W - 3), y: y - 4, s: 10 }); // torch sconce
+  }
+  // end chamber — for the cactus temple, a taller arena where the king waits
+  const arenaW = Math.min(level === 6 ? 18 : 9, W - 4 - xc);
+  const arenaH = level === 6 ? 9 : 6;
+  for (let k = 0; k < arenaW; k++)
+    for (let dy = 1; dy <= arenaH; dy++) tiles[(y - dy) * W + xc + k] = AIR;
+  const doors = level === 6
+    ? [{ x: Math.min(xc + arenaW - 3, W - 4), y: y - 1, kind: 'cactus', target: 5 }]
+    : [{ x: Math.min(xc + 4, W - 4), y: y - 1, kind: 'sand', target: 5 }];
+  const boss = level === 6 ? {
+    x: (xc + arenaW / 2) * T - 18, y: y * T - 44,
+    minX: (xc + 1) * T, maxX: (xc + arenaW - 4) * T,
+    hp: 3, inv: 0, atk: 1.5, dir: -1, dead: false, squash: 0,
+  } : null;
+
+  const climbMask = new Uint8Array(W * H);
+  const stickyMask = new Uint8Array(W * H);
+  const floraByCol = [];
+  for (let i = 0; i < W; i++) floraByCol.push([]);
+  const reach = computeReach(tiles, climbMask, stickyMask, spawnTile);
+  const canReturn = computeReturn(tiles, climbMask, stickyMask, spawnTile);
+  const crabs = placeCrabs(tiles, reach, spawnTile, doors, rng);
+  // the cactus temple grows spikes instead of crabs — they never move
+  const spikes = [];
+  if (level === 6) {
+    const taken = new Set();
+    const spots = [];
+    for (let y2 = 4; y2 < H - 4; y2++) {
+      for (let x2 = 3; x2 < W - 3; x2++) {
+        const i = y2 * W + x2;
+        if (!reach[i]) continue;
+        // only mid-run on flat ground: 2 walkable columns to either side at the
+        // same height, so a spike is always a plain jump — never on stair steps
+        let flat = true;
+        for (let dx = -2; dx <= 2 && flat; dx++)
+          if (tiles[i + dx] !== AIR || tiles[i + W + dx] !== STONE) flat = false;
+        if (!flat) continue;
+        if (Math.abs(x2 - spawnTile.x) + Math.abs(y2 - spawnTile.y) < 10) continue;
+        if (doors.some(d => Math.abs(x2 - d.x) < 5 && Math.abs(y2 - d.y) < 4)) continue;
+        let nearLiquid = false;
+        for (let dx = -2; dx <= 2 && !nearLiquid; dx++)
+          if (tiles[i + dx] === WATER || tiles[i + W + dx] === WATER) nearLiquid = true;
+        if (nearLiquid) continue;
+        spots.push({ x: x2, y: y2 });
+      }
+    }
+    for (let n = 0; n < 30 && spots.length; n++) {
+      const s = spots.splice((rng() * spots.length) | 0, 1)[0];
+      let crowded = false;
+      for (let dx = -3; dx <= 3; dx++) if (taken.has(`${s.x + dx},${s.y}`)) crowded = true;
+      if (crowded) { n--; if (!spots.length) break; continue; }
+      taken.add(`${s.x},${s.y}`);
+      spikes.push({ x: s.x, y: s.y });
+    }
+    // the course must stay beatable WITH the spikes in place: spike tiles are
+    // forbidden positions (jump over, never touch) — shed spikes until the
+    // exit is provably reachable under that rule
+    const mask = new Uint8Array(W * H);
+    for (const s of spikes) mask[s.y * W + s.x] = 1;
+    const exitOK = () => {
+      const r2 = computeReach(tiles, climbMask, stickyMask, spawnTile, false, mask);
+      const d = doors[0];
+      return !!(r2[d.y * W + d.x] || r2[d.y * W + d.x + 1]);
+    };
+    while (spikes.length && !exitOK()) {
+      const s = spikes.pop();
+      mask[s.y * W + s.x] = 0;
+    }
+  }
+  const waterSurf = [];
+  for (let i = W; i < W * H; i++) {
+    if (tiles[i] === WATER && tiles[i - W] === AIR) waterSurf.push(i);
+  }
+  for (const i of waterSurf) emitters.push({ x: i % W, y: (i / W) | 0, s: PAL.liquidLight });
+  const staticLight = computeStaticLight(tiles, emitters);
+
+  world = { seed, level, tiles, staticLight, floraByCol, waterSurf, dripPoints: [],
+            glowMoss: new Set(), spawn: spawnTile, entrance: doors[0], climbMask, stickyMask,
+            reach, canReturn, trapCount: 0, doorSkilled: false, crabs, spikes, boss,
+            needles: [], doors, key: null, waterfall: null, volcano: null, bombs: [],
+            trampolines: [], hoppers: [], terrainCanvas: null };
+  world.terrainCanvas = prerenderTerrain();
+  mapCanvas = buildMapCanvas();
+  return world;
+}
+
+// grasshoppers: hop-about patrollers bound to their home platform for life
+function placeHoppers(tiles, reach, spawnTile, doors, rng) {
+  const hoppers = [];
+  const spots = [];
+  for (let y = 4; y < H - 4; y++) {
+    for (let x = 3; x < W - 4; x++) {
+      const i = y * W + x;
+      if (tiles[i] !== AIR || tiles[i + W] !== STONE) continue;
+      if (tiles[i + 1] !== AIR || tiles[i + 1 + W] !== STONE) continue;
+      if (tiles[i - W] !== AIR) continue; // room to hop
+      if (!reach[i]) continue;
+      if (Math.abs(x - spawnTile.x) + Math.abs(y - spawnTile.y) < 18) continue;
+      if (doors.some(d => Math.abs(x - d.x) < 6 && Math.abs(y - d.y) < 5)) continue;
+      spots.push({ x, y });
+    }
+  }
+  for (let n = 0; n < CFG.hopperCount && spots.length; n++) {
+    const s = spots.splice((rng() * spots.length) | 0, 1)[0];
+    // the platform it will never leave
+    let lx = s.x, rx = s.x;
+    while (lx > 1 && tiles[s.y * W + lx - 1] === AIR && tiles[(s.y + 1) * W + lx - 1] === STONE) lx--;
+    while (rx < W - 2 && tiles[s.y * W + rx + 1] === AIR && tiles[(s.y + 1) * W + rx + 1] === STONE) rx++;
+    hoppers.push({
+      x: s.x * T + 2, y: (s.y + 1) * T - 10, vx: 0, vy: 0,
+      minX: lx * T + 1, maxX: (rx + 1) * T - 13,
+      t: rng() * 2, grounded: true, dir: 1, squash: 0, dead: false,
+    });
+  }
+  return hoppers;
+}
+
+function generateWorld(seed, level = 1) {
+  PAL = THEMES[level];
+  buildBackground();
+  cactusWin = null;
+  if (level === 4 || level === 6) return generateTempleWorld(seed, level);
+  const rng = mulberry32(seed);
+  let tiles = new Uint8Array(W * H);
+  let buf = new Uint8Array(W * H);
+
+  // --- Pass 1: cellular automata ---
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const edge = Math.min(x, y, W - 1 - x, H - 1 - y);
+      if (edge < 4) { tiles[y * W + x] = STONE; continue; }
+      let p = PAL.fillProb ?? CFG.fillProb;
+      if (edge < CFG.edgeDist) p += CFG.edgeBias * (1 - edge / CFG.edgeDist);
+      tiles[y * W + x] = rng() < p ? STONE : AIR;
+    }
+  }
+  for (let it = 0; it < CFG.caIters; it++) {
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        let n = 0; // majority-of-9 smoothing (cell itself included; OOB counts as stone)
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx, ny = y + dy;
+            if (nx < 0 || nx >= W || ny < 0 || ny >= H || tiles[ny * W + nx] === STONE) n++;
+          }
+        }
+        buf[y * W + x] = n >= 5 ? STONE : AIR;
+      }
+    }
+    [tiles, buf] = [buf, tiles];
+  }
+
+  // --- Pass 1.5: the great waterfall (lush cave only) — 20 wide, 40 tall ---
+  // carved before connectivity so the chamber gets tunneled into the cave and
+  // every later guarantee (reachability, softlock aids) applies to it too
+  let waterfall = null;
+  if (level === 1) {
+    const wfW = 20, wfH = 40;
+    const wx = 12 + ((rng() * (W - 24 - wfW)) | 0);
+    const wy = 24 + ((rng() * (H - 70 - wfH)) | 0);
+    for (let y = wy; y < wy + wfH; y++)
+      for (let x = wx; x < wx + wfW; x++)
+        tiles[y * W + x] = AIR;
+    for (let x = wx - 1; x <= wx + wfW; x++)      // solid basin floor
+      for (let y = wy + wfH; y < Math.min(H - 1, wy + wfH + 3); y++)
+        tiles[y * W + x] = STONE;
+    for (let x = wx; x < wx + wfW; x++)           // the plunge pool, 3 deep
+      for (let y = wy + wfH - 3; y < wy + wfH; y++)
+        tiles[y * W + x] = WATER;
+    for (let y = wy + wfH - 3; y < wy + wfH; y++) { // stone rims contain it
+      tiles[y * W + wx - 1] = STONE;
+      tiles[y * W + wx + wfW] = STONE;
+    }
+    waterfall = { x: wx, w: wfW, top: wy, bot: wy + wfH - 3 };
+  }
+
+  // --- Pass 1.6: the volcano (infernory only) — same bones, opposite temper ---
+  let volcano = null;
+  if (level === 2) {
+    const vW = 20, vH = 40;
+    const wx = 12 + ((rng() * (W - 24 - vW)) | 0);
+    const wy = 24 + ((rng() * (H - 70 - vH)) | 0);
+    for (let y = wy; y < wy + vH; y++)
+      for (let x = wx; x < wx + vW; x++)
+        tiles[y * W + x] = AIR;
+    const baseY = wy + vH; // chamber floor
+    for (let x = wx - 1; x <= wx + vW; x++)
+      for (let y = baseY; y < Math.min(H - 1, baseY + 3); y++)
+        tiles[y * W + x] = STONE;
+    // the cone rises from the floor, tapering toward the crater
+    const cx = wx + 10, coneH = 14;
+    for (let dy = 0; dy < coneH; dy++) {
+      const half = Math.max(2, Math.round(((coneH - dy) * 8) / coneH));
+      for (let x = cx - half; x <= cx + half; x++)
+        tiles[(baseY - 1 - dy) * W + x] = STONE;
+    }
+    // crater: 2 wide, 3 deep, brimming with lava
+    const craterY = baseY - coneH;
+    for (let dy = 0; dy < 3; dy++)
+      for (let x = cx - 1; x <= cx; x++)
+        tiles[(craterY + dy) * W + x] = WATER;
+    volcano = { x: wx, w: vW, top: wy, bot: baseY, craterX: cx, craterY, t: 2.5 };
+  }
+
+  // --- Pass 2: connectivity ---
+  const labelRegions = () => {
+    const labels = new Int32Array(W * H).fill(-1);
+    const regions = [];
+    const queue = new Int32Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      if (tiles[i] !== AIR || labels[i] !== -1) continue;
+      const id = regions.length;
+      const cells = [];
+      let head = 0, tail = 0;
+      queue[tail++] = i; labels[i] = id;
+      while (head < tail) {
+        const c = queue[head++];
+        cells.push(c);
+        const cx = c % W, cy = (c / W) | 0;
+        const nbs = [c - 1, c + 1, c - W, c + W];
+        const ok = [cx > 0, cx < W - 1, cy > 0, cy < H - 1];
+        for (let k = 0; k < 4; k++) {
+          const ni = nbs[k];
+          if (ok[k] && tiles[ni] === AIR && labels[ni] === -1) { labels[ni] = id; queue[tail++] = ni; }
+        }
+      }
+      regions.push(cells);
+    }
+    return regions;
+  };
+
+  let regions = labelRegions();
+  let mainIdx = 0;
+  for (let i = 1; i < regions.length; i++) if (regions[i].length > regions[mainIdx].length) mainIdx = i;
+  const mainCells = regions[mainIdx];
+
+  const carveBrush = (cx, cy) => {
+    for (let dy = -2; dy <= 2; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        if (dx * dx + dy * dy > 4) continue;
+        const nx = cx + dx, ny = cy + dy;
+        if (nx >= 1 && nx < W - 1 && ny >= 1 && ny < H - 1) tiles[ny * W + nx] = AIR;
+      }
+    }
+  };
+
+  for (let r = 0; r < regions.length; r++) {
+    if (r === mainIdx || regions[r].length < CFG.minRegionTunnel) continue;
+    // centroid of the orphan region
+    let sx = 0, sy = 0;
+    for (const c of regions[r]) { sx += c % W; sy += (c / W) | 0; }
+    let cx = Math.round(sx / regions[r].length), cy = Math.round(sy / regions[r].length);
+    // nearest main-region cell
+    let best = -1, bestD = Infinity;
+    for (let k = 0; k < mainCells.length; k += 7) { // sample for speed
+      const c = mainCells[k];
+      const mx = c % W, my = (c / W) | 0;
+      const d = (mx - cx) * (mx - cx) + (my - cy) * (my - cy);
+      if (d < bestD) { bestD = d; best = c; }
+    }
+    const tx = best % W, ty = (best / W) | 0;
+    // winding walk with a 2-radius brush
+    let guard = 0;
+    while ((cx !== tx || cy !== ty) && guard++ < 1000) {
+      carveBrush(cx, cy);
+      const ddx = tx - cx, ddy = ty - cy;
+      let stepX = Math.abs(ddx) >= Math.abs(ddy);
+      if (rng() < 0.25) stepX = !stepX;
+      if (stepX && ddx !== 0) cx += Math.sign(ddx);
+      else if (ddy !== 0) cy += Math.sign(ddy);
+      else if (ddx !== 0) cx += Math.sign(ddx);
+    }
+    carveBrush(tx, ty);
+  }
+
+  // re-flood; fill everything outside the main region
+  regions = labelRegions();
+  mainIdx = 0;
+  for (let i = 1; i < regions.length; i++) if (regions[i].length > regions[mainIdx].length) mainIdx = i;
+  for (let r = 0; r < regions.length; r++) {
+    if (r === mainIdx) continue;
+    for (const c of regions[r]) tiles[c] = STONE;
+  }
+
+  // --- Pass 3: spawn (spiral scan from upper-middle) ---
+  let spawnTile = null;
+  outer:
+  for (let rad = 0; rad < 160; rad++) {
+    for (let dy = -rad; dy <= rad; dy++) {
+      for (let dx = -rad; dx <= rad; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== rad) continue;
+        const x = 100 + dx, y = 60 + dy;
+        if (x < 1 || x >= W - 1 || y < 2 || y >= H - 1) continue;
+        if (tiles[y * W + x] === AIR && tiles[(y - 1) * W + x] === AIR &&
+            tiles[(y - 2) * W + x] === AIR && tiles[(y + 1) * W + x] === STONE) {
+          spawnTile = { x, y };
+          break outer;
+        }
+      }
+    }
+  }
+  if (!spawnTile) { // extremely unlikely fallback
+    for (let i = W; i < W * (H - 1); i++) {
+      if (tiles[i] === AIR && tiles[i + W] === STONE) { spawnTile = { x: i % W, y: (i / W) | 0 }; break; }
+    }
+  }
+
+  // --- Pass 4: water pools — carved basins, contained by construction ---
+  // collect every floor point with headroom, shuffle, then greedily carve pools
+  const anchors = [];
+  for (let y = CFG.poolMinRow; y < H - 8; y++)
+    for (let x = 8; x < W - 8; x++)
+      if (tiles[y * W + x] === AIR && tiles[(y - 1) * W + x] === AIR &&
+          tiles[(y + 1) * W + x] === STONE) anchors.push({ x, y });
+  for (let i = anchors.length - 1; i > 0; i--) {
+    const j = (rng() * (i + 1)) | 0;
+    [anchors[i], anchors[j]] = [anchors[j], anchors[i]];
+  }
+  const poolCenters = [];
+  let pools = 0;
+  for (const a of anchors) {
+    if (pools >= CFG.poolTarget) break;
+    const hw = 2 + ((rng() * 4) | 0);   // half-width 2..5 (pool 5..11 wide)
+    const D = 2 + ((rng() * 2) | 0);    // depth 2..3
+    const x = a.x, y = a.y;
+    if (poolCenters.some(c => Math.abs(c.x - x) < 14 && Math.abs(c.y - y) < 10)) continue;
+    let ok = true;
+    // stone side columns contain the water; dig zone must be solid from 2 rows down
+    for (const sx of [x - (hw + 1), x + (hw + 1)])
+      for (let dy = 1; dy <= D + 2 && ok; dy++)
+        if (tiles[(y + dy) * W + sx] !== STONE) ok = false;
+    for (let dx = -hw; dx <= hw && ok; dx++)
+      for (let dy = 2; dy <= D + 2 && ok; dy++)
+        if (tiles[(y + dy) * W + x + dx] !== STONE) ok = false;
+    if (!ok) continue;
+    if (Math.abs(x - spawnTile.x) < 8 && Math.abs(y - spawnTile.y) < 8) continue; // never drown the spawn
+    // terraform: flatten the surface row, dig a parabolic bowl, fill it
+    for (let dx = -hw; dx <= hw; dx++) {
+      tiles[y * W + x + dx] = AIR;
+      const d = Math.max(1, Math.round(D * (1 - (dx / (hw + 0.5)) ** 2)));
+      for (let dy = 1; dy <= d; dy++) tiles[(y + dy) * W + x + dx] = WATER;
+    }
+    poolCenters.push({ x, y });
+    pools++;
+  }
+
+  const climbMask = new Uint8Array(W * H); // big-vine tiles the player can climb
+
+  // --- Pass 5: flora + emitters + glow moss + drip points ---
+  const floraByCol = [];
+  for (let x = 0; x < W; x++) floraByCol.push([]);
+  const emitters = [];
+  const glowMoss = new Set();
+  const dripPoints = [];
+  const mushCols = new Set(); // avoid stacking mushrooms on the same 2 columns as a giant
+
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      const t = tiles[i];
+
+      if (t === STONE) {
+        // glow moss on exposed faces
+        const exposed = tiles[i - W] !== STONE || tiles[i + W] !== STONE ||
+                        tiles[i - 1] !== STONE || tiles[i + 1] !== STONE;
+        if (exposed && hash2(x, y, seed) % 100 < (PAL.glowMossPct ?? CFG.glowMossPct)) {
+          glowMoss.add(i);
+          // light emits from the adjacent open tile
+          const open = tiles[i - W] !== STONE ? [x, y - 1] :
+                       tiles[i + W] !== STONE ? [x, y + 1] :
+                       tiles[i - 1] !== STONE ? [x - 1, y] : [x + 1, y];
+          emitters.push({ x: open[0], y: open[1], s: CFG.lightMoss });
+        }
+        continue;
+      }
+      if (t !== AIR) continue;
+
+      // cacti: rigid green columns on sand floors (desert only)
+      if (PAL.cactusChance && tiles[i + W] === STONE && rng() < PAL.cactusChance) {
+        floraByCol[x].push({
+          type: 'cactus', x, y,
+          height: 10 + ((rng() * 14) | 0), arms: rng() < 0.6,
+          glow: false, phase: 0, variant: hash2(x, y, seed ^ 0xcac7),
+        });
+      }
+
+      // grass tufts: dense on grassy-theme floors; purely decorative, sways on touch
+      if (PAL.grassy && tiles[i + W] === STONE && rng() < PAL.grassChance) {
+        floraByCol[x].push({
+          type: 'grass', x, y,
+          height: 5 + ((rng() * 6) | 0), blades: 2 + ((rng() * 2) | 0),
+          bend: 0, bendVel: 0,
+          glow: false, phase: rng() * Math.PI * 2, variant: hash2(x, y, seed ^ 0x97a5),
+        });
+      }
+
+      // giant bouncy mushrooms: need a 3-wide flat floor and 5 tiles of headroom
+      if (tiles[i + W] === STONE && rng() < CFG.trampolineChance) {
+        let room = true;
+        for (let dx = -1; dx <= 1 && room; dx++) {
+          if (tiles[i + dx] !== AIR || tiles[i + W + dx] !== STONE) room = false;
+          for (let dy = 1; dy <= 5 && room; dy++)
+            if (tiles[(y - dy) * W + x + dx] !== AIR) room = false;
+        }
+        if (room) {
+          floraByCol[x].push({ type: 'tramp', x, y, springT: 0, glow: false, phase: rng() * Math.PI * 2, variant: hash2(x, y, seed ^ 0xb0c) });
+          mushCols.add(i); mushCols.add(i + 1);
+        }
+      }
+
+      // mushrooms: air with stone floor; continuous size, clamped by headroom
+      if (tiles[i + W] === STONE && !mushCols.has(i) && rng() < (PAL.mushroomChance ?? CFG.mushroomChance)) {
+        const headroom = tiles[i - W] === AIR;
+        let size = 0.55 + rng() * (headroom ? 0.9 : 0.35); // low ceiling -> stay under 1 tile
+        const canGiant = headroom && tiles[i - 1] === AIR && tiles[i + 1] === AIR &&
+                         tiles[i + 1 - W] === AIR && tiles[i + 1 + W] === STONE;
+        if (canGiant && rng() < 0.12) size = 1.5 + rng() * 0.5; // wide-cap giant, ~2 tiles tall
+        const glow = rng() < 0.6;
+        const f = { type: 'mush', x, y, size, glow, phase: rng() * Math.PI * 2, variant: hash2(x, y, seed) };
+        floraByCol[x].push(f);
+        if (size >= 1.5) mushCols.add(i + 1);
+      }
+
+      // big climbable vines: stone ceiling with a tall open drop below
+      let placedBig = false;
+      if (tiles[i - W] === STONE && rng() < (PAL.bigvineChance ?? CFG.bigvineChance)) {
+        const want = 4 + ((rng() * 7) | 0); // 4..10 tiles
+        let len = 0;
+        while (len < want && y + len < H && tiles[(y + len) * W + x] === AIR &&
+               tiles[(y + len + 1) * W + x] === AIR) len++;
+        if (len >= 4) {
+          floraByCol[x].push({ type: 'bigvine', x, y, len, glow: rng() < 0.3, phase: rng() * Math.PI * 2, variant: hash2(x, y + 2, seed) });
+          for (let k = 0; k < len; k++) climbMask[(y + k) * W + x] = 1;
+          placedBig = true;
+        }
+      }
+
+      // thin vines: air with stone ceiling (decorative only)
+      if (!placedBig && tiles[i - W] === STONE && rng() < (PAL.vineChance ?? CFG.vineChance)) {
+        const want = 2 + ((rng() * 5) | 0);
+        let len = 0;
+        while (len < want && y + len < H && tiles[(y + len) * W + x] === AIR &&
+               tiles[(y + len + 1) * W + x] === AIR) len++;
+        if (len >= 1) {
+          floraByCol[x].push({ type: 'vine', x, y, len, glow: rng() < 0.3, phase: rng() * Math.PI * 2, variant: hash2(x, y + 1, seed) });
+        }
+      }
+
+      // drip points: air with stone ceiling
+      if (tiles[i - W] === STONE && hash2(x, y, seed ^ 0x5eed) % 100 < CFG.dripPct) {
+        dripPoints.push({ x, y, next: rng() * 6 });
+      }
+    }
+  }
+
+  // --- Pass 5.5: sticky slime walls on tall exposed vertical faces ---
+  const stickyMask = new Uint8Array(W * H);
+  for (let x = 1; x < W - 1; x++) {
+    for (const side of [-1, 1]) {
+      let y = 1;
+      while (y < H - 1) {
+        if (tiles[y * W + x] === STONE && tiles[y * W + x + side] === AIR) {
+          let y2 = y;
+          while (y2 < H - 1 && tiles[y2 * W + x] === STONE && tiles[y2 * W + x + side] === AIR) y2++;
+          if (y2 - y >= 4 && rng() < CFG.stickyRunChance) {
+            for (let yy = y; yy < y2; yy++) stickyMask[yy * W + x] = 1;
+          }
+          y = y2;
+        } else y++;
+      }
+    }
+  }
+
+  // --- Pass 6.4: anchor the spawn in the cave's best-connected heart ---
+  // scored on MUTUAL connectivity (reach from + return to) — return-only would
+  // pick attractor pits everything drains into but nothing leaves
+  {
+    const cands = [spawnTile];
+    for (let tries = 0; tries < 40 && cands.length < 6; tries++) {
+      const x = 4 + ((rng() * (W - 8)) | 0), y = 4 + ((rng() * (H - 8)) | 0);
+      const i = y * W + x;
+      if (tiles[i] === AIR && tiles[i - W] === AIR && tiles[i - 2 * W] === AIR &&
+          tiles[i + W] === STONE) cands.push({ x, y });
+    }
+    const cans = computeReturnMulti(tiles, climbMask, stickyMask, cands, true);
+    let best = 0, bestScore = -1;
+    for (let k = 0; k < cands.length; k++) {
+      const fwd = computeReach(tiles, climbMask, stickyMask, cands[k], true);
+      let score = 0;
+      for (let i = 0; i < W * (H - 1); i++)
+        if (cans[k][i] && fwd[i] && tiles[i] !== STONE && tiles[i + W] === STONE) score++;
+      if (score > bestScore) { bestScore = score; best = k; }
+    }
+    spawnTile = cands[best];
+  }
+
+  // --- Pass 6: reachability, aided until most of the cave is traversable ---
+  // coverage is measured over standable floor positions (reach marks standing
+  // states, not every open air tile). expandReach is reused later if the door
+  // needs a farther reachable site.
+  let reach = computeReach(tiles, climbMask, stickyMask, spawnTile);
+  const standable = i => tiles[i] !== STONE && tiles[i + W] === STONE;
+  let floorCount = 0;
+  for (let i = 0; i < W * (H - 1); i++) if (standable(i)) floorCount++;
+  const expandReach = (targetFrac, iters, cap) => {
+    for (let iter = 0; iter < iters; iter++) {
+      let reached = 0;
+      for (let i = 0; i < W * (H - 1); i++) if (reach[i] && standable(i)) reached++;
+      if (reached >= floorCount * targetFrac) break;
+      // frontier shafts: open unreached tiles with reached ground below get an aid —
+      // sticky slime if a wall is beside them, otherwise a rescue vine from the ceiling
+      let added = 0;
+      const vineCols = new Set(); // keep aid vines spaced out
+      for (let y = 2; y < H - 2 && added < cap; y++) {
+        for (let x = 1; x < W - 1 && added < cap; x++) {
+          const i = y * W + x;
+          if (tiles[i] === STONE || reach[i] || climbMask[i]) continue;
+          let reachedRow = -1;
+          for (let dy = 1; dy <= 4; dy++) {
+            const j = (y + dy) * W + x;
+            if (tiles[j] === STONE) break;
+            if (reach[j]) { reachedRow = y + dy; break; }
+          }
+          if (reachedRow < 0) continue;
+          let aided = false;
+          for (const side of [-1, 1]) {
+            const j = i + side;
+            if (tiles[j] === STONE && !stickyMask[j]) { stickyMask[j] = 1; added++; aided = true; }
+          }
+          if (aided) continue;
+          // no wall beside: hang a climbable vine from the ceiling above, down to the
+          // reached spot — spaced out so wide caverns don't become vine curtains
+          let tooClose = false;
+          for (let dx = -3; dx <= 3; dx++) if (vineCols.has(x + dx)) tooClose = true;
+          if (tooClose) continue;
+          let cy = y;
+          while (cy > 1 && tiles[(cy - 1) * W + x] !== STONE) cy--;
+          if (tiles[(cy - 1) * W + x] === STONE && reachedRow - cy + 1 >= 2) {
+            const len = reachedRow - cy + 1;
+            floraByCol[x].push({ type: 'bigvine', x, y: cy, len, glow: false, phase: rng() * Math.PI * 2, variant: hash2(x, cy, seed) });
+            for (let k = 0; k < len; k++) climbMask[(cy + k) * W + x] = 1;
+            vineCols.add(x);
+            added++;
+          }
+        }
+      }
+      if (!added) break;
+      reach = computeReach(tiles, climbMask, stickyMask, spawnTile);
+    }
+  };
+  expandReach(0.40, 5, 40);
+
+  // --- Pass 6.5: softlock elimination — anywhere you might land, you can leave ---
+  // trap = a supported spot a player could plausibly reach (generous model) but
+  // from which spawn is provably unreachable (conservative model). Fix each with
+  // sticky slime on its walls, or a rescue vine, until none remain.
+  let canReturn;
+  {
+    let lastTraps = Infinity;
+    for (let iter = 0; iter < 24; iter++) {
+      const M = makeMoveModel(tiles, climbMask, stickyMask);
+      const rGen = computeReach(tiles, climbMask, stickyMask, spawnTile, true);
+      canReturn = computeReturn(tiles, climbMask, stickyMask, spawnTile, true);
+      const isTrap = new Uint8Array(W * H);
+      const vineCols = new Set();
+      let traps = 0, added = 0, firstTrap = null;
+      for (let y = 2; y < H - 2; y++) {
+        for (let x = 1; x < W - 1; x++) {
+          const i = y * W + x;
+          // only ground/water positions count as traps — a wall-hang or vine perch
+          // escapes by dropping to the ground below it, which is judged separately
+          const grounded = tiles[i + W] === STONE || tiles[i] === WATER;
+          if (!rGen[i] || canReturn[i] || !grounded || !M.validPos(x, y)) continue;
+          isTrap[i] = 1;
+          if (!traps) firstTrap = { x, y };
+          traps++;
+          let aided = false;
+          for (const side of [-1, 1]) {
+            const j = i + side;
+            if (tiles[j] === STONE && !stickyMask[j]) { stickyMask[j] = 1; added++; aided = true; }
+          }
+          // chip a lintel: an open side passage blocked only by one head-height stone
+          if (!aided) {
+            for (const side of [-1, 1]) {
+              const ax = x + side;
+              if (ax < 2 || ax >= W - 2 || y < 3) continue;
+              const jHead = (y - 1) * W + ax;
+              if (tiles[y * W + ax] === STONE || tiles[jHead] !== STONE) continue;
+              // never breach water; a vine anchored to this stone is pruned, not protected
+              if (tiles[jHead - 1] === WATER || tiles[jHead + 1] === WATER ||
+                  tiles[jHead - W] === WATER || tiles[jHead + W] === WATER) continue;
+              floraByCol[ax] = floraByCol[ax].filter(f => {
+                if ((f.type === 'vine' || f.type === 'bigvine') && f.y === y) {
+                  if (f.type === 'bigvine')
+                    for (let k = 0; k < f.len; k++) climbMask[(f.y + k) * W + f.x] = 0;
+                  return false;
+                }
+                return true;
+              });
+              tiles[jHead] = AIR;
+              added++; aided = true;
+              break;
+            }
+          }
+          if (!aided && !climbMask[i]) {
+            let tooClose = false;
+            for (let dx = -3; dx <= 3; dx++) if (vineCols.has(x + dx)) tooClose = true;
+            if (tooClose) continue;
+            let cy = y;
+            while (cy > 1 && tiles[(cy - 1) * W + x] !== STONE) cy--;
+            if (tiles[(cy - 1) * W + x] === STONE && y - cy + 1 >= 2) {
+              const len = y - cy + 1;
+              floraByCol[x].push({ type: 'bigvine', x, y: cy, len, glow: false, phase: rng() * Math.PI * 2, variant: hash2(x, cy, seed) });
+              for (let k = 0; k < len; k++) climbMask[(cy + k) * W + x] = 1;
+              vineCols.add(x);
+              added++;
+            }
+          }
+        }
+      }
+      // last-resort tier: flood trapped pockets into sump pools — a pocket you
+      // fell into becomes swimmable, so you float back out. The zone is the
+      // non-returnable air around each trap; water grows to a fixpoint so every
+      // water cell stays sealed by stone/water on both sides and below.
+      const zone = new Uint8Array(W * H);
+      const zq = [];
+      for (let i = 0; i < W * H; i++) if (isTrap[i] && tiles[i] === AIR) { zone[i] = 1; zq.push(i); }
+      let zh = 0;
+      while (zh < zq.length) {
+        const i = zq[zh++];
+        const zx = i % W, zy = (i / W) | 0;
+        for (const [nx, ny] of [[zx - 1, zy], [zx + 1, zy], [zx, zy - 1], [zx, zy + 1]]) {
+          if (nx < 1 || nx >= W - 1 || ny < 1 || ny >= H - 1) continue;
+          const j = ny * W + nx;
+          if (!zone[j] && tiles[j] === AIR && !canReturn[j]) { zone[j] = 1; zq.push(j); }
+        }
+      }
+      let flooded = true;
+      while (flooded) {
+        flooded = false;
+        for (let y = H - 3; y >= 2; y--) {
+          for (let x = 1; x < W - 1; x++) {
+            const i = y * W + x;
+            if (!zone[i] || tiles[i] !== AIR) continue;
+            const sealed = t => t === STONE || t === WATER;
+            if (sealed(tiles[i + W]) && sealed(tiles[i - 1]) && sealed(tiles[i + 1])) {
+              tiles[i] = WATER; added++; flooded = true;
+            }
+          }
+        }
+      }
+      if (globalThis.DEBUG_GEN) console.log(`trap iter ${iter}: traps ${traps}, aids ${added}${firstTrap ? ` first (${firstTrap.x},${firstTrap.y})` : ''}`);
+      if (!traps) break;
+      const plateaued = traps >= lastTraps;
+      lastTraps = traps;
+      if (!added || plateaued) {
+        // escalation: carve a 2-tall passage along the air path from a stuck trap
+        // toward returnable ground; later iterations aid the new route as needed
+        const prev = new Int32Array(W * H).fill(-2);
+        const q = [firstTrap.y * W + firstTrap.x];
+        prev[q[0]] = -1;
+        let goal = -1, h = 0;
+        while (h < q.length) {
+          const i = q[h++];
+          const x = i % W, y = (i / W) | 0;
+          if (canReturn[i] && M.validPos(x, y)) { goal = i; break; }
+          for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
+            if (nx < 2 || nx >= W - 2 || ny < 2 || ny >= H - 2) continue;
+            const j = ny * W + nx;
+            if (prev[j] !== -2 || tiles[j] === STONE) continue;
+            prev[j] = i; q.push(j);
+          }
+        }
+        const path = [];
+        for (let i = goal; i >= 0; i = prev[i]) path.push(i);
+        for (const i of path) {
+          const x = i % W, y = (i / W) | 0;
+          const jH = (y - 1) * W + x;
+          if (tiles[jH] !== STONE) continue;
+          if (tiles[jH - 1] === WATER || tiles[jH + 1] === WATER ||
+              tiles[jH - W] === WATER || tiles[jH + W] === WATER) continue;
+          floraByCol[x] = floraByCol[x].filter(f => {
+            if ((f.type === 'vine' || f.type === 'bigvine') && f.y === y) {
+              if (f.type === 'bigvine')
+                for (let k = 0; k < f.len; k++) climbMask[(f.y + k) * W + f.x] = 0;
+              return false;
+            }
+            return true;
+          });
+          tiles[jH] = AIR;
+          added++;
+        }
+        // vertical stretches of the path get a climbing vine if they lack one
+        for (let k = 0; k + 1 < path.length; k++) {
+          const a = path[k], b = path[k + 1];
+          if (Math.abs(a - b) !== W) continue;
+          const lo = Math.max(a, b);
+          const x = lo % W, y = (lo / W) | 0;
+          if (climbMask[lo] || climbMask[Math.min(a, b)]) continue;
+          let cy = y;
+          while (cy > 1 && tiles[(cy - 1) * W + x] !== STONE) cy--;
+          if (tiles[(cy - 1) * W + x] === STONE && y - cy + 1 >= 2) {
+            const len = y - cy + 1;
+            floraByCol[x].push({ type: 'bigvine', x, y: cy, len, glow: false, phase: rng() * Math.PI * 2, variant: hash2(x, cy, seed) });
+            for (let j = 0; j < len; j++) climbMask[(cy + j) * W + x] = 1;
+            added++;
+          }
+        }
+        if (globalThis.DEBUG_GEN) console.log(`  escalation: goal ${goal}, total aids now ${added}`);
+        if (!added) break; // truly stuck; the door will still avoid these spots
+      }
+    }
+    // rebuild climbMask from surviving big vines (prunes can leave overlaps stale),
+    // then compute the final state for door placement and the stored guarantee
+    climbMask.fill(0);
+    for (let x = 0; x < W; x++)
+      for (const f of floraByCol[x])
+        if (f.type === 'bigvine')
+          for (let k = 0; k < f.len; k++) climbMask[(f.y + k) * W + f.x] = 1;
+    reach = computeReach(tiles, climbMask, stickyMask, spawnTile);
+    canReturn = computeReturn(tiles, climbMask, stickyMask, spawnTile);
+  }
+  const Mfinal = makeMoveModel(tiles, climbMask, stickyMask);
+  const rGenFinal = computeReach(tiles, climbMask, stickyMask, spawnTile, true);
+  const canReturnGen = computeReturn(tiles, climbMask, stickyMask, spawnTile, true);
+  let doorSkilled = false;
+  let trapCount = 0;
+  for (let y = 2; y < H - 2; y++)
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      const grounded = tiles[i + W] === STONE || tiles[i] === WATER;
+      if (rGenFinal[i] && !canReturnGen[i] && grounded && Mfinal.validPos(x, y)) trapCount++;
+    }
+
+  // then the entrance goes on a REACHED floor spot
+  let entrance = null;
+  {
+    const collect = (rM, cM) => {
+      const cand = [];
+      for (let y = 4; y < H - 2; y++) {
+        for (let x = 2; x < W - 3; x++) {
+          const i = y * W + x;
+          if (tiles[i + W] !== STONE || tiles[i + 1 + W] !== STONE) continue;
+          if (rM && !((rM[i] && cM[i]) || (rM[i + 1] && cM[i + 1]))) continue;
+          let open = true;
+          for (let dy = 0; dy <= 2 && open; dy++)
+            for (let dx = 0; dx <= 1 && open; dx++) {
+              const j = (y - dy) * W + x + dx;
+              if (tiles[j] !== AIR || climbMask[j]) open = false;
+            }
+          if (!open) continue;
+          cand.push({ x, y, d: Math.abs(x - spawnTile.x) + Math.abs(y - spawnTile.y) });
+        }
+      }
+      return cand;
+    };
+    const inBand = (c, lo, hi) => c.d >= lo && c.d <= hi;
+    let cand = collect(reach, canReturn);
+    let band = cand.filter(c => inBand(c, CFG.doorMinDist, CFG.doorMaxDist));
+    // no reachable site in the ring? grow traversability until one appears
+    for (let attempt = 0; attempt < 3 && !band.length; attempt++) {
+      expandReach(0.5 + attempt * 0.15, 3, 80);
+      canReturn = computeReturn(tiles, climbMask, stickyMask, spawnTile);
+      cand = collect(reach, canReturn);
+      band = cand.filter(c => inBand(c, CFG.doorMinDist, CFG.doorMaxDist));
+    }
+    // still none: pick a ring site the skilled model can use and build an
+    // assisted route to it (carved lintels + climbing vines along an air path)
+    if (!band.length) {
+      const gBand = collect(rGenFinal, canReturnGen)
+        .filter(c => inBand(c, CFG.doorMinDist, CFG.doorMaxDist));
+      if (gBand.length) {
+        const t2 = gBand[(rng() * gBand.length) | 0];
+        const prev = new Int32Array(W * H).fill(-2);
+        const q0 = [t2.y * W + t2.x];
+        prev[q0[0]] = -1;
+        let goal = -1, h2 = 0;
+        while (h2 < q0.length) {
+          const i = q0[h2++];
+          const x = i % W, y = (i / W) | 0;
+          if (reach[i]) { goal = i; break; }
+          for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
+            if (nx < 2 || nx >= W - 2 || ny < 2 || ny >= H - 2) continue;
+            const j = ny * W + nx;
+            if (prev[j] !== -2 || tiles[j] === STONE) continue;
+            prev[j] = i; q0.push(j);
+          }
+        }
+        if (goal >= 0) {
+          const path = [];
+          for (let i = goal; i >= 0; i = prev[i]) path.push(i);
+          for (const i of path) {
+            const x = i % W, y = (i / W) | 0;
+            const jH = (y - 1) * W + x;
+            if (tiles[jH] !== STONE) continue;
+            if (tiles[jH - 1] === WATER || tiles[jH + 1] === WATER ||
+                tiles[jH - W] === WATER || tiles[jH + W] === WATER) continue;
+            floraByCol[x] = floraByCol[x].filter(f => {
+              if ((f.type === 'vine' || f.type === 'bigvine') && f.y === y) {
+                if (f.type === 'bigvine')
+                  for (let k = 0; k < f.len; k++) climbMask[(f.y + k) * W + f.x] = 0;
+                return false;
+              }
+              return true;
+            });
+            tiles[jH] = AIR;
+          }
+          for (let k = 0; k + 1 < path.length; k++) {
+            const a = path[k], b = path[k + 1];
+            if (Math.abs(a - b) !== W) continue;
+            const lo = Math.max(a, b);
+            const x = lo % W, y = (lo / W) | 0;
+            if (climbMask[lo] || climbMask[Math.min(a, b)]) continue;
+            let cy = y;
+            while (cy > 1 && tiles[(cy - 1) * W + x] !== STONE) cy--;
+            if (tiles[(cy - 1) * W + x] === STONE && y - cy + 1 >= 2) {
+              const len = y - cy + 1;
+              floraByCol[x].push({ type: 'bigvine', x, y: cy, len, glow: false, phase: rng() * Math.PI * 2, variant: hash2(x, cy, seed) });
+              for (let j = 0; j < len; j++) climbMask[(cy + j) * W + x] = 1;
+            }
+          }
+          reach = computeReach(tiles, climbMask, stickyMask, spawnTile);
+          canReturn = computeReturn(tiles, climbMask, stickyMask, spawnTile);
+          cand = collect(reach, canReturn);
+          band = cand.filter(c => inBand(c, CFG.doorMinDist, CFG.doorMaxDist));
+        }
+        if (!band.length) {
+          // a genuinely jump-heavy map: put the door on a ring site that skilled
+          // play (running jumps, wall-jumps) reaches — still escape-proof
+          entrance = gBand[(rng() * gBand.length) | 0];
+          doorSkilled = true;
+        }
+      }
+    }
+    // and only then: widen the ring step by step rather than picking arbitrarily
+    if (!entrance) {
+      for (let widen = 10; widen <= 70 && !band.length; widen += 10) {
+        band = cand.filter(c => inBand(c, Math.max(30, CFG.doorMinDist - widen), CFG.doorMaxDist + widen));
+      }
+      if (!cand.length) cand = collect(null, null); // should never happen; last-resort fallback
+      let pool = band;
+      if (!pool.length) {
+        // no ringed spot at all — take the farthest tenth, never an arbitrary one
+        cand.sort((a, b) => b.d - a.d);
+        pool = cand.slice(0, Math.max(1, (cand.length / 10) | 0));
+      }
+      if (pool.length) entrance = pool[(rng() * pool.length) | 0];
+    }
+  }
+  // clear ground flora out of the doorway (big vines were excluded by the candidate filter)
+  if (entrance) {
+    for (let x = entrance.x - 1; x <= entrance.x + 2; x++) {
+      floraByCol[x] = floraByCol[x].filter(f =>
+        f.type === 'bigvine' || f.y < entrance.y - 3 || f.y > entrance.y + 1);
+    }
+  }
+
+  // --- Pass 7.2: the doors, and the key that opens the black one ---
+  const doors = [];
+  let key = null;
+  {
+    const blackTarget = level === 3 ? 'win' : level === 5 ? 1 : level + 1;
+    if (entrance) doors.push({ x: entrance.x, y: entrance.y, kind: 'black', target: blackTarget });
+    if (level === 5) {
+      // the great cactus: vast, purple-rimmed, and hollow — it leads somewhere
+      const sites = [];
+      for (let y = 6; y < H - 2; y++) {
+        for (let x = 3; x < W - 4; x++) {
+          const i = y * W + x;
+          if (tiles[i + W] !== STONE || tiles[i + 1 + W] !== STONE) continue;
+          if (!((reach[i] && canReturn[i]) || (reach[i + 1] && canReturn[i + 1]))) continue;
+          let open = true;
+          for (let dy = 0; dy <= 3 && open; dy++)
+            for (let dx = -1; dx <= 2 && open; dx++)
+              if (tiles[(y - dy) * W + x + dx] !== AIR || climbMask[(y - dy) * W + x + dx]) open = false;
+          if (!open) continue;
+          if (Math.abs(x - spawnTile.x) + Math.abs(y - spawnTile.y) < 35) continue;
+          if (entrance && Math.abs(x - entrance.x) + Math.abs(y - entrance.y) < 25) continue;
+          sites.push({ x, y });
+        }
+      }
+      if (sites.length) {
+        const c2 = sites[(rng() * sites.length) | 0];
+        doors.push({ x: c2.x, y: c2.y, kind: 'cactus', target: 6 });
+        for (let x = Math.max(0, c2.x - 1); x <= Math.min(W - 1, c2.x + 2); x++) {
+          floraByCol[x] = floraByCol[x].filter(f =>
+            f.glow || f.type === 'bigvine' || f.y < c2.y - 4 || f.y > c2.y + 1);
+        }
+      }
+    }
+    if (level <= 3) {
+      // grey door: an unlocked side door into the Temple — distance rules relax
+      // until a site exists, so it always spawns
+      let sites = [];
+      for (const [dSpawn, dDoor] of [[35, 30], [20, 15], [8, 6]]) {
+        sites = [];
+        for (let y = 4; y < H - 2; y++) {
+          for (let x = 2; x < W - 3; x++) {
+            const i = y * W + x;
+            if (tiles[i + W] !== STONE || tiles[i + 1 + W] !== STONE) continue;
+            if (!((reach[i] && canReturn[i]) || (reach[i + 1] && canReturn[i + 1]))) continue;
+            let open = true;
+            for (let dy = 0; dy <= 2 && open; dy++)
+              for (let dx = 0; dx <= 1 && open; dx++) {
+                const j = (y - dy) * W + x + dx;
+                if (tiles[j] !== AIR || climbMask[j]) open = false;
+              }
+            if (!open) continue;
+            if (Math.abs(x - spawnTile.x) + Math.abs(y - spawnTile.y) < dSpawn) continue;
+            if (entrance && Math.abs(x - entrance.x) + Math.abs(y - entrance.y) < dDoor) continue;
+            sites.push({ x, y });
+          }
+        }
+        if (sites.length) break;
+      }
+      if (sites.length) {
+        const g2 = sites[(rng() * sites.length) | 0];
+        doors.push({ x: g2.x, y: g2.y, kind: 'grey', target: 4 });
+        // clear non-glowing ground flora from the grey doorway (emitters are already built)
+        for (let x = Math.max(0, g2.x - 1); x <= Math.min(W - 1, g2.x + 2); x++) {
+          floraByCol[x] = floraByCol[x].filter(f =>
+            f.glow || f.type === 'bigvine' || f.y < g2.y - 3 || f.y > g2.y + 1);
+        }
+      }
+      // the key, hidden on a reachable floor away from spawn and both doors —
+      // distance rules relax until a spot exists, so a key always spawns
+      for (const [dSpawn, dDoor] of [[30, 25], [20, 15], [8, 4]]) {
+        const keySpots = [];
+        for (let y = 4; y < H - 2; y++) {
+          for (let x = 2; x < W - 2; x++) {
+            const i = y * W + x;
+            if (tiles[i] !== AIR || tiles[i + W] !== STONE) continue;
+            if (!reach[i] || !canReturn[i]) continue;
+            if (Math.abs(x - spawnTile.x) + Math.abs(y - spawnTile.y) < dSpawn) continue;
+            if (doors.some(d => Math.abs(x - d.x) + Math.abs(y - d.y) < dDoor)) continue;
+            keySpots.push({ x, y });
+          }
+        }
+        if (keySpots.length) {
+          const k = keySpots[(rng() * keySpots.length) | 0];
+          key = { x: k.x, y: k.y, taken: false };
+          break;
+        }
+      }
+    }
+  }
+
+  // --- Pass 7.5: crabs (and, in the green levels, grasshoppers) ---
+  const crabs = placeCrabs(tiles, reach, spawnTile, doors, rng);
+  const hoppers = (level === 1 || level === 3)
+    ? placeHoppers(tiles, reach, spawnTile, doors, rng) : [];
+
+  // drop mushrooms swallowed by sump pools or whose floor was chipped away
+  for (let x = 0; x < W; x++) {
+    floraByCol[x] = floraByCol[x].filter(f =>
+      !(f.type === 'mush' && (tiles[f.y * W + f.x] === WATER || tiles[(f.y + 1) * W + f.x] !== STONE)));
+  }
+  const waterSurf = [];
+  for (let i = W; i < W * H; i++) {
+    if (tiles[i] === WATER && tiles[i - W] === AIR) waterSurf.push(i);
+  }
+
+  // flora light emitters (built after pruning so removed flora casts no light)
+  for (let x = 0; x < W; x++) {
+    for (const f of floraByCol[x]) {
+      if (!f.glow) continue;
+      if (f.type === 'mush') emitters.push({ x: f.x, y: f.y, s: f.size >= 1.5 ? CFG.lightMushroom + 1 : CFG.lightMushroom });
+      else if (f.type === 'vine') emitters.push({ x: f.x, y: f.y + f.len - 1, s: CFG.lightVine });
+      else if (f.type === 'bigvine') emitters.push({ x: f.x, y: f.y + ((f.len / 2) | 0), s: CFG.lightVine });
+    }
+  }
+
+  for (const i of waterSurf) emitters.push({ x: i % W, y: (i / W) | 0, s: PAL.liquidLight });
+
+  // flat physics list for the bouncy mushrooms (built after doorway prunes)
+  const trampolines = [];
+  for (let x = 0; x < W; x++)
+    for (const f of floraByCol[x]) if (f.type === 'tramp') trampolines.push(f);
+
+  const staticLight = computeStaticLight(tiles, emitters);
+
+  world = { seed, level, tiles, staticLight, floraByCol, waterSurf, dripPoints, glowMoss,
+            spawn: spawnTile, entrance, climbMask, stickyMask, reach, canReturn, trapCount,
+            doorSkilled, crabs, spikes: [], boss: null, needles: [], doors, key,
+            waterfall, volcano, bombs: [], trampolines, hoppers, terrainCanvas: null };
+  world.terrainCanvas = prerenderTerrain();
+  mapCanvas = buildMapCanvas();
+  return world;
+}
+
+// =============================================================
+// TERRAIN PRERENDER — the whole static world baked once
+// =============================================================
+const THEMES = {
+  1: { // the lush cave
+    name: 'THE LUSH CAVE', title: '#9dffb0',
+    stone: '#2e3b3a', stoneDeep: '#1c2423',
+    speckA: '#232d2c', speckB: '#3d4c46',
+    topHi: '#46584f', botSh: '#161d1c',
+    mossA: '#3f7d4f', mossB: '#6ab04c', mossGlow: '#7cfc9a',
+    waterBase: 'rgba(30,90,120,0.9)', waterLine: '#7fd4e8',
+    waterTint: 'rgba(64,150,180,1)', bubble: '#bfe8f5', liquidLight: 4,
+    capA: '#57e6c9', capB: '#b07ce8', stem: '#d8e6dc',
+    vine: '#2f6d45', vineGlow: '#9dffb0',
+    bigA: '#1f4a30', bigB: '#2f6d45', leaf: '#3f8d55',
+    gooA: '#3fd9c8', gooB: '#2a9d92', gooHi: '#8ff2e6',
+    hintMoss: '#8a63c2', hintMossGlow: '#c9a2ff', hintSpore: '#d9c2ff',
+    doorRim: '#3a2b4d', darkB: 4, darkR: 0,
+    bgTop: '#0b1116', bgBot: '#0d1b1e', blob: '#0a1418',
+    body: '#e8d5a0', spore: '#c9ffd8', sporeRise: false,
+  },
+  2: { // the infernory
+    name: 'THE INFERNORY', title: '#ff9a5c',
+    stone: '#3b2a26', stoneDeep: '#241a17',
+    speckA: '#2d1f1b', speckB: '#4c352c',
+    topHi: '#5a3c30', botSh: '#1a100d',
+    mossA: '#7d3f2f', mossB: '#b0574c', mossGlow: '#ff9a5c',
+    waterBase: 'rgba(180,60,10,0.95)', waterLine: '#ffcf7d',
+    waterTint: 'rgba(255,120,50,1)', bubble: '#ffd9a0', liquidLight: 8,
+    capA: '#ff8c3b', capB: '#e83a3a', stem: '#4a3530',
+    vine: '#6b3a2a', vineGlow: '#ffb066',
+    bigA: '#3a2015', bigB: '#4a2c1e', leaf: '#8a4a2a',
+    gooA: '#ff5c3c', gooB: '#b03a24', gooHi: '#ffb28a',
+    hintMoss: '#4a7ba8', hintMossGlow: '#7de0ff', hintSpore: '#bfeaff',
+    doorRim: '#26364d', darkB: 0, darkR: 8,
+    bgTop: '#160b08', bgBot: '#241008', blob: '#1c0d08',
+    body: '#e8d5a0', spore: '#ffc08a', sporeRise: true,
+    liquidScorch: true, // lava: linger too long and it spits you back to the start
+  },
+  3: { // the grassy shrove — wide open, half in daylight
+    name: 'THE GRASSY SHROVE', title: '#b8ff7d',
+    stone: '#4a4436', stoneDeep: '#332f24',
+    speckA: '#3b3729', speckB: '#5c5540',
+    topHi: '#6a6248', botSh: '#26221a',
+    mossA: '#4f9a35', mossB: '#8fd44f', mossGlow: '#e4ff9a',
+    waterBase: 'rgba(40,110,150,0.85)', waterLine: '#9fe4f2',
+    waterTint: 'rgba(90,180,210,1)', bubble: '#dff6fc', liquidLight: 5,
+    capA: '#e84a3a', capB: '#f2ede0', stem: '#efe8d2',
+    vine: '#3f8d3f', vineGlow: '#d6ff8a',
+    bigA: '#2f5c22', bigB: '#4f8a35', leaf: '#7dc44f',
+    gooA: '#e8c33f', gooB: '#b0902a', gooHi: '#ffe88a', // amber sap
+    hintMoss: '#c45a9e', hintMossGlow: '#ff9ad4', hintSpore: '#ffc4e4',
+    doorRim: '#4d2b46', darkB: 2, darkR: 2,
+    bgTop: '#2b3d22', bgBot: '#18240f', blob: '#223018',
+    body: '#e8d5a0', spore: '#f7f2b0', sporeRise: false,
+    fillProb: 0.405, ambient: 4, darkMax: 190, // open caverns, never pitch black
+    grassy: true, grassChance: 0.55, // floors sprout swaying grass
+  },
+  4: { // the temple — a stone-brick gauntlet of lava and crabs
+    name: 'THE TEMPLE', title: '#c9b28a',
+    stone: '#5a5a5f', stoneDeep: '#3a3a40',
+    speckA: '#4a4a50', speckB: '#6a6a70',
+    topHi: '#75757c', botSh: '#26262c',
+    mossA: '#6a6a70', mossB: '#7a7a80', mossGlow: '#c9b28a',
+    waterBase: 'rgba(180,60,10,0.95)', waterLine: '#ffcf7d',
+    waterTint: 'rgba(255,120,50,1)', bubble: '#ffd9a0', liquidLight: 8,
+    capA: '#c9b28a', capB: '#8a8a92', stem: '#4a4a50',
+    vine: '#5a5a5f', vineGlow: '#c9b28a',
+    bigA: '#3a3a40', bigB: '#5a5a5f', leaf: '#6a6a70',
+    gooA: '#c9b28a', gooB: '#8f7a4a', gooHi: '#ffe8b0',
+    hintMoss: '#c45a9e', hintMossGlow: '#ff9ad4', hintSpore: '#ffc4e4',
+    doorRim: '#6b5a3a', darkB: 0, darkR: 4,
+    bgTop: '#1a1a20', bgBot: '#101014', blob: '#141418',
+    body: '#e8d5a0', spore: '#ffc08a', sporeRise: true,
+    liquidScorch: true, bricks: true, darkMax: 215, noHang: true, // masonry is too smooth to grip
+    crabCount: 25, mushroomChance: 0, vineChance: 0, bigvineChance: 0, glowMossPct: 0,
+  },
+  5: { // the unknown desert — bright sand, dry heat
+    name: 'THE UNKNOWN DESERT', title: '#ffdf8a',
+    stone: '#c2a86b', stoneDeep: '#8f7a4a',
+    speckA: '#a8905a', speckB: '#d4bc80',
+    topHi: '#e0c887', botSh: '#6b5a38',
+    mossA: '#e8d49a', mossB: '#f2e4b4', mossGlow: '#fff2c4', // sand drifts on every face
+    waterBase: 'rgba(40,120,140,0.85)', waterLine: '#9fe4f2',
+    waterTint: 'rgba(90,190,210,1)', bubble: '#dff6fc', liquidLight: 5,
+    capA: '#5a8a3f', capB: '#7ba84f', stem: '#4a6b34', // cactus-green fungi
+    vine: '#8f7a4a', vineGlow: '#ffe8a0',
+    bigA: '#6b5a38', bigB: '#8f7a4a', leaf: '#a8905a',
+    gooA: '#e8c33f', gooB: '#b0902a', gooHi: '#ffe88a',
+    hintMoss: '#7a4aa8', hintMossGlow: '#c9a2ff', hintSpore: '#e0ccff',
+    doorRim: '#4d3a6b', darkB: 0, darkR: 2,
+    bgTop: '#4a3c22', bgBot: '#241c0e', blob: '#382e1a',
+    body: '#e8d5a0', spore: '#f2e0b0', sporeRise: false, // dust motes
+    fillProb: 0.42, ambient: 6, darkMax: 150,
+    mushroomChance: 0.05, vineChance: 0.03, bigvineChance: 0.02, glowMossPct: 3,
+    cactusChance: 0.07, // sand floors sprout cacti
+  },
+  6: { // the cactus temple — a gauntlet grown, not built; spikes do not move
+    name: 'THE CACTUS TEMPLE', title: '#b8e88a',
+    stone: '#4a7a38', stoneDeep: '#2f5424',
+    speckA: '#3f6b2f', speckB: '#5c8f44',
+    topHi: '#6aa04f', botSh: '#1e3a16',
+    mossA: '#5c8f44', mossB: '#6aa04f', mossGlow: '#d8f2a0',
+    waterBase: 'rgba(150,180,30,0.9)', waterLine: '#dff26a',
+    waterTint: 'rgba(180,220,60,1)', bubble: '#eaf7b0', liquidLight: 7,
+    capA: '#d8f2a0', capB: '#b06ce8', stem: '#2f5424',
+    vine: '#4a7a38', vineGlow: '#d8f2a0',
+    bigA: '#2f5424', bigB: '#4a7a38', leaf: '#6aa04f',
+    gooA: '#dff26a', gooB: '#9ab03a', gooHi: '#f4ffb0',
+    hintMoss: '#c45a9e', hintMossGlow: '#ff9ad4', hintSpore: '#ffc4e4',
+    doorRim: '#b06ce8', darkB: 2, darkR: 0,
+    bgTop: '#14200e', bgBot: '#0c1408', blob: '#101a0c',
+    body: '#e8d5a0', spore: '#d8f2a0', sporeRise: false,
+    liquidScorch: true, bricks: true, mortar: '#1e3a16', darkMax: 210, noHang: true,
+    crabCount: 0, mushroomChance: 0, vineChance: 0, bigvineChance: 0, glowMossPct: 0,
+  },
+};
+let PAL = THEMES[1];
+
+function prerenderTerrain() {
+  const c = document.createElement('canvas');
+  c.width = W * T; c.height = H * T;
+  const g = c.getContext('2d');
+  const { tiles, glowMoss, seed, stickyMask, entrance } = world;
+
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const t = tiles[i];
+      const px = x * T, py = y * T;
+
+      if (t === WATER) {
+        g.fillStyle = PAL.waterBase;
+        g.fillRect(px, py, T, T);
+        continue;
+      }
+      if (t !== STONE) continue;
+
+      const h = hash2(x, y, seed);
+      const upOpen = y > 0 && tiles[i - W] !== STONE;
+      const dnOpen = y < H - 1 && tiles[i + W] !== STONE;
+      const lOpen = x > 0 && tiles[i - 1] !== STONE;
+      const rOpen = x < W - 1 && tiles[i + 1] !== STONE;
+      const interior = !upOpen && !dnOpen && !lOpen && !rOpen;
+
+      g.fillStyle = interior ? PAL.stoneDeep : PAL.stone;
+      g.fillRect(px, py, T, T);
+
+      if (PAL.bricks) { // temple masonry: mortar lines instead of moss
+        g.fillStyle = PAL.mortar || '#2c2c30';
+        g.fillRect(px, py + T - 1, T, 1);
+        g.fillRect(px + ((y & 1) ? 4 : 11), py, 1, T);
+        if (upOpen) { g.fillStyle = PAL.topHi; g.fillRect(px, py, T, 2); }
+        if (dnOpen) { g.fillStyle = PAL.botSh; g.fillRect(px, py + T - 3, T, 2); }
+        continue;
+      }
+
+      // speckle texture
+      const n = 2 + (h % 3);
+      for (let s = 0; s < n; s++) {
+        const sh = hash2(x * 7 + s, y * 13 + s, seed);
+        g.fillStyle = (sh & 1) ? PAL.speckA : PAL.speckB;
+        g.fillRect(px + (sh % 13), py + ((sh >> 4) % 13), 2, 2);
+      }
+
+      const isGlow = glowMoss.has(i);
+      let moss = isGlow ? PAL.mossGlow : lerpColor(PAL.mossA, PAL.mossB, (h % 100) / 100);
+      if (entrance) { // subtle hint: moss blushes violet as you near the door
+        const dd = Math.hypot(x - entrance.x, y - entrance.y);
+        if (dd < CFG.hintRadius) {
+          const f = 1 - dd / CFG.hintRadius;
+          moss = lerpColor((h & 1) ? PAL.mossA : PAL.mossB,
+                           isGlow ? PAL.hintMossGlow : PAL.hintMoss, 0.25 + 0.55 * f);
+        }
+      }
+
+      if (upOpen) {
+        g.fillStyle = PAL.topHi;
+        g.fillRect(px, py, T, 2);
+        g.fillStyle = moss;
+        g.fillRect(px, py, T, 5);
+        // grass blade ticks poking into the air above
+        for (let b = 0; b < 3; b++) {
+          const bh = hash2(x * 3 + b, y, seed ^ 0xb1ade);
+          if (bh % 3 === 0) continue;
+          g.fillRect(px + 1 + (bh % 14), py - 2 - (bh % 2), 1, 3);
+        }
+      }
+      if (dnOpen) {
+        g.fillStyle = PAL.botSh;
+        g.fillRect(px, py + T - 2, T, 2);
+        g.fillStyle = moss;
+        g.fillRect(px, py + T - 3, T, 3);
+        // hanging bumps
+        const bh = hash2(x, y, seed ^ 0xdeca);
+        g.fillRect(px + (bh % 12), py + T, 2, 1 + (bh % 2));
+      }
+      if (lOpen) {
+        g.fillStyle = moss;
+        g.fillRect(px, py, 3, T);
+        const bh = hash2(x, y, seed ^ 0x1ef7);
+        g.fillRect(px + 3, py + (bh % 12), 1, 3);
+      }
+      if (rOpen) {
+        g.fillStyle = moss;
+        g.fillRect(px + T - 3, py, 3, T);
+        const bh = hash2(x, y, seed ^ 0x217);
+        g.fillRect(px + T - 4, py + (bh % 12), 1, 3);
+      }
+
+      // sticky slime: glossy teal coat on wall-jumpable faces
+      if (stickyMask[i]) {
+        if (lOpen) {
+          g.fillStyle = PAL.gooA; g.fillRect(px, py, 3, T);
+          g.fillStyle = PAL.gooB; g.fillRect(px + 3, py + (h % 10), 1, 4);
+          g.fillStyle = PAL.gooHi; g.fillRect(px, py + ((h >> 2) % 12), 1, 2);
+        }
+        if (rOpen) {
+          g.fillStyle = PAL.gooA; g.fillRect(px + T - 3, py, 3, T);
+          g.fillStyle = PAL.gooB; g.fillRect(px + T - 4, py + ((h >> 3) % 10), 1, 4);
+          g.fillStyle = PAL.gooHi; g.fillRect(px + T - 1, py + ((h >> 5) % 12), 1, 2);
+        }
+      }
+    }
+  }
+  return c;
+}
+
+// =============================================================
+// BACKGROUND (cached gradient + parallax silhouettes)
+// =============================================================
+let bgCanvas = null, blobCanvas = null;
+function buildBackground() {
+  bgCanvas = document.createElement('canvas');
+  bgCanvas.width = CFG.VIEW_W; bgCanvas.height = CFG.VIEW_H;
+  const g = bgCanvas.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, CFG.VIEW_H);
+  grad.addColorStop(0, PAL.bgTop);
+  grad.addColorStop(1, PAL.bgBot);
+  g.fillStyle = grad;
+  g.fillRect(0, 0, CFG.VIEW_W, CFG.VIEW_H);
+
+  blobCanvas = document.createElement('canvas');
+  blobCanvas.width = CFG.VIEW_W; blobCanvas.height = CFG.VIEW_H;
+  const b = blobCanvas.getContext('2d');
+  const brng = mulberry32(1234);
+  b.fillStyle = PAL.blob;
+  for (let i = 0; i < 14; i++) {
+    const bx = brng() * CFG.VIEW_W, by = brng() * CFG.VIEW_H;
+    const rx = 40 + brng() * 120, ry = 25 + brng() * 70;
+    b.beginPath();
+    b.ellipse(bx, by, rx, ry, brng() * Math.PI, 0, Math.PI * 2);
+    b.fill();
+  }
+}
+
+// =============================================================
+// PLAYER
+// =============================================================
+const player = {
+  x: 0, y: 0, vx: 0, vy: 0,
+  onGround: false, inWater: false, facing: 1,
+  coyote: 0, jumpBuf: 0, moving: false,
+  climbing: false, wallDir: 0, wallTimer: 0, wallLock: 0,
+  lavaTime: 0, hanging: false, hangDir: 1, hangCd: 0, mantleLock: 0,
+  dashTimer: 0, dashCd: 0, dashDir: 1,
+};
+let scorchFlash = 0;
+
+function resetPlayer() {
+  player.x = world.spawn.x * T + (T - CFG.playerW) / 2;
+  player.y = (world.spawn.y + 1) * T - CFG.playerH;
+  player.vx = 0; player.vy = 0;
+  player.onGround = false; player.inWater = false;
+  cam.x = player.x - CFG.VIEW_W / 2;
+  cam.y = player.y - CFG.VIEW_H / 2;
+  clampCam();
+}
+
+function collideAxis(axis, delta) {
+  const p = player;
+  if (axis === 'x') p.x += delta; else p.y += delta;
+  const x0 = Math.floor(p.x / T), x1 = Math.floor((p.x + CFG.playerW - 0.01) / T);
+  const y0 = Math.floor(p.y / T), y1 = Math.floor((p.y + CFG.playerH - 0.01) / T);
+  for (let ty = y0; ty <= y1; ty++) {
+    for (let tx = x0; tx <= x1; tx++) {
+      if (!isSolid(tx, ty)) continue;
+      if (axis === 'x') {
+        if (delta > 0) p.x = tx * T - CFG.playerW - 0.01;
+        else p.x = (tx + 1) * T + 0.01;
+        if (p.mantleLock <= 0) p.vx = 0; // mantling keeps pushing until the lip clears
+      } else {
+        if (delta > 0) { p.y = ty * T - CFG.playerH - 0.01; p.vy = 0; p.onGround = true; }
+        else { p.y = (ty + 1) * T + 0.01; p.vy = 0; }
+      }
+      return;
+    }
+  }
+}
+
+function updatePlayer(dt) {
+  const p = player;
+  const cx = (p.x + CFG.playerW / 2) / T, cy = (p.y + CFG.playerH / 2) / T;
+  const wasInWater = p.inWater;
+  p.inWater = tileAt(cx | 0, cy | 0) === WATER;
+  const headInAir = tileAt(cx | 0, ((p.y + 3) / T) | 0) !== WATER;
+
+  // lava scorches: linger past the limit and the level spits you back to its start
+  if (p.inWater && PAL.liquidScorch) {
+    p.lavaTime += dt;
+    if (p.lavaTime >= CFG.lavaMaxTime) {
+      p.lavaTime = 0;
+      scorchFlash = 0.9; // full-red death pulse, then fade
+      for (let i = 0; i < 12; i++) {
+        spawnParticle({ type: 'splash', x: p.x + Math.random() * CFG.playerW, y: p.y + Math.random() * CFG.playerH, vx: (Math.random() - 0.5) * 120, vy: -60 - Math.random() * 80, life: 0.4 });
+      }
+      resetPlayer();
+      return;
+    }
+  } else {
+    p.lavaTime = 0;
+  }
+
+  if (p.inWater && !wasInWater && p.vy > 50) {
+    p.vy *= 0.4;
+    for (let i = 0; i < 5; i++) {
+      spawnParticle({ type: 'bubble', x: p.x + Math.random() * CFG.playerW, y: p.y + CFG.playerH / 2, vy: -20 - Math.random() * 15, life: 2 });
+    }
+  }
+
+  const left = keys.has('ArrowLeft') || keys.has('KeyA');
+  const right = keys.has('ArrowRight') || keys.has('KeyD');
+  const upHeld = keys.has('ArrowUp') || keys.has('KeyW');
+  const down = keys.has('ArrowDown') || keys.has('KeyS');
+  // on a climbable vine, W/Up mean "climb" — only Space jumps
+  const feetTy = ((p.y + CFG.playerH - 2) / T) | 0;
+  const headTy = ((p.y + 2) / T) | 0;
+  const canClimb = !p.inWater &&
+    (maskAt(world.climbMask, cx | 0, feetTy) || maskAt(world.climbMask, cx | 0, headTy));
+  const jumpHeld = keys.has('Space') || (!canClimb && upHeld);
+  const jumpPressed = justPressed.has('Space') ||
+    (!canClimb && (justPressed.has('ArrowUp') || justPressed.has('KeyW')));
+
+  if (canClimb && (upHeld || down)) p.climbing = true;
+  if (!canClimb || p.inWater) p.climbing = false;
+
+  // hanging from a platform lip: hold on until you jump up, drop, or pull away
+  if (p.hanging) {
+    if (p.inWater || p.climbing) {
+      p.hanging = false;
+    } else {
+      p.moving = false;
+      p.vx = 0; p.vy = 0;
+      p.facing = p.hangDir;
+      const away = p.hangDir === 1 ? left : right;
+      if (jumpPressed) { // mantle up onto the platform
+        p.hanging = false; p.hangCd = 0.25;
+        p.vy = CFG.jumpVy;
+        p.vx = p.hangDir * 110;
+        p.mantleLock = 0.3; // idle air friction pauses so the push carries over the lip
+      } else if (down || away) { // let go
+        p.hanging = false; p.hangCd = 0.3;
+      } else {
+        return;
+      }
+    }
+  }
+
+  const accel = p.inWater ? CFG.waterAccel : (p.onGround ? CFG.accel : CFG.airAccel);
+  const maxRun = p.inWater ? CFG.waterMaxRun : CFG.maxRun;
+  const friction = p.inWater ? CFG.waterFriction : CFG.friction;
+
+  let move = 0;
+  if (left) move -= 1;
+  if (right) move += 1;
+  p.moving = move !== 0;
+  if (move !== 0) {
+    p.facing = move;
+    p.vx += move * accel * dt;
+    p.vx = Math.max(-maxRun, Math.min(maxRun, p.vx));
+  } else if (p.mantleLock <= 0 || p.onGround) {
+    const f = friction * dt;
+    if (Math.abs(p.vx) <= f) p.vx = 0;
+    else p.vx -= Math.sign(p.vx) * f;
+  }
+
+  // timers
+  p.wallLock = Math.max(0, p.wallLock - dt);
+  p.mantleLock = Math.max(0, p.mantleLock - dt);
+  p.dashCd = Math.max(0, p.dashCd - dt);
+
+  // dash: a flat 3-block burst in the direction you face or hold
+  if ((justPressed.has('ShiftLeft') || justPressed.has('ShiftRight')) &&
+      p.dashCd <= 0 && !p.hanging && !p.climbing) {
+    p.dashTimer = CFG.dashTime;
+    p.dashCd = CFG.dashCooldown;
+    p.dashDir = move !== 0 ? move : p.facing;
+    p.facing = p.dashDir;
+  }
+  if (p.onGround) p.coyote = CFG.coyoteTime;
+  else p.coyote = Math.max(0, p.coyote - dt);
+  if (jumpPressed) p.jumpBuf = CFG.jumpBuffer;
+  else p.jumpBuf = Math.max(0, p.jumpBuf - dt);
+
+  if (p.inWater) {
+    if (jumpPressed && headInAir) {
+      p.vy = CFG.surfaceLeap; // leap out of the pool
+    } else if (jumpHeld) {
+      p.vy = Math.max(p.vy - CFG.swimAccel * dt, CFG.swimThrust);
+    }
+    if (down) p.vy += CFG.swimAccel * 0.6 * dt;
+    p.vy += CFG.waterGravity * dt;
+    p.vy = Math.min(p.vy, CFG.waterMaxFall);
+    // swim bubbles
+    if ((p.moving || jumpHeld) && Math.random() < 0.08) {
+      spawnParticle({ type: 'bubble', x: p.x + Math.random() * CFG.playerW, y: p.y + 4, vy: -20, life: 3 });
+    }
+  } else if (p.climbing) {
+    p.vy = upHeld ? -CFG.climbSpeed : down ? CFG.climbSpeed : 0;
+    if (jumpPressed) { p.vy = CFG.jumpVy * 0.9; p.climbing = false; p.jumpBuf = 0; }
+  } else {
+    // sticky wall contact (either side, anywhere along the body)
+    let wc = 0;
+    if (!p.onGround) {
+      const yT = Math.floor(p.y / T), yB = Math.floor((p.y + CFG.playerH - 1) / T);
+      const lx = Math.floor((p.x - 2) / T), rx = Math.floor((p.x + CFG.playerW + 1) / T);
+      for (let ty = yT; ty <= yB; ty++) {
+        if (maskAt(world.stickyMask, lx, ty) && isSolid(lx, ty)) wc = -1;
+        else if (wc === 0 && maskAt(world.stickyMask, rx, ty) && isSolid(rx, ty)) wc = 1;
+      }
+    }
+    if (wc !== 0) { p.wallDir = wc; p.wallTimer = CFG.wallCoyote; }
+    else p.wallTimer = Math.max(0, p.wallTimer - dt);
+
+    if (p.jumpBuf > 0 && (p.onGround || p.coyote > 0)) {
+      p.vy = CFG.jumpVy;
+      p.onGround = false; p.coyote = 0; p.jumpBuf = 0;
+    } else if (jumpPressed && !p.onGround && p.wallTimer > 0) {
+      p.vy = CFG.wallJumpVy;                 // kick up and away from the wall
+      p.vx = -p.wallDir * CFG.wallJumpVx;
+      p.wallTimer = 0; p.jumpBuf = 0;
+      p.wallLock = CFG.wallJumpLock;
+    }
+    // floatier rise while jump is held; brisk fall
+    p.vy += (p.vy < 0 && jumpHeld ? CFG.riseGravity : CFG.gravity) * dt;
+    if (wc !== 0 && move === wc && p.vy > CFG.wallSlide) p.vy = CFG.wallSlide; // cling-slide
+    p.vy = Math.min(p.vy, CFG.maxFall);
+  }
+
+  // dash overrides everything else while active: flat, fast, gravity-free
+  if (p.dashTimer > 0) {
+    p.dashTimer -= dt;
+    p.vx = p.dashDir * CFG.dashSpeed;
+    p.vy = 0;
+    if (p.dashTimer <= 0) p.vx = p.dashDir * CFG.maxRun; // ease out of the burst
+    spawnParticle({ type: 'ghost', x: p.x, y: p.y, life: 0.18 });
+  }
+
+  p.onGround = false;
+  collideAxis('x', p.vx * dt);
+  collideAxis('y', p.vy * dt);
+
+  // bouncy mushrooms: fall onto a giant cap and it flings you skyward
+  if (p.vy > 80 && !p.inWater) {
+    for (const tr of world.trampolines) {
+      if (tr.springT > 0.25) continue; // mid-squash, no double-trigger
+      const cx3 = tr.x * T + 8;
+      const capTop = (tr.y + 1) * T - 24;
+      if (p.x + CFG.playerW > cx3 - 20 && p.x < cx3 + 20 &&
+          p.y + CFG.playerH > capTop - 2 && p.y + CFG.playerH < capTop + 12) {
+        p.vy = CFG.trampolineVy;
+        tr.springT = 0.35;
+        for (let i = 0; i < 6; i++) {
+          spawnParticle({ type: 'spore', hint: 0, x: cx3 - 16 + Math.random() * 32, y: capTop + 4, vy: -30 - Math.random() * 40, phase: Math.random() * 6.3, size: 2, life: 0.8 });
+        }
+        break;
+      }
+    }
+  }
+
+  // ledge grab: falling past a platform lip right beside you catches your hands
+  // (temple masonry is too smooth to grip — no hanging there)
+  p.hangCd = Math.max(0, p.hangCd - dt);
+  if (!p.onGround && !p.inWater && !p.climbing && !p.hanging && p.vy > 40 &&
+      p.hangCd <= 0 && !PAL.noHang) {
+    for (const dir of [-1, 1]) {
+      const hx = dir === 1 ? Math.floor((p.x + CFG.playerW + 2) / T) : Math.floor((p.x - 3) / T);
+      const topRow = Math.floor((p.y + 3) / T);
+      // a lip: solid tile whose two tiles above are open (room to mantle)
+      if (!isSolid(hx, topRow) || isSolid(hx, topRow - 1) || isSolid(hx, topRow - 2)) continue;
+      const ledgeTop = topRow * T;
+      if (p.y < ledgeTop - 3 || p.y > ledgeTop + 7) continue; // hands near the lip
+      const gap = dir === 1 ? hx * T - (p.x + CFG.playerW) : p.x - (hx + 1) * T;
+      if (gap < -1 || gap > 4) continue;
+      // the snapped hang pose must fit in open space
+      const nx = dir === 1 ? hx * T - CFG.playerW - 0.01 : (hx + 1) * T + 0.01;
+      const ny = ledgeTop - 2;
+      let fits = true;
+      for (let ty = Math.floor(ny / T); ty <= Math.floor((ny + CFG.playerH - 0.01) / T) && fits; ty++)
+        for (let tx = Math.floor(nx / T); tx <= Math.floor((nx + CFG.playerW - 0.01) / T) && fits; tx++)
+          if (isSolid(tx, ty)) fits = false;
+      if (!fits) continue;
+      p.hanging = true; p.hangDir = dir; p.facing = dir;
+      p.vx = 0; p.vy = 0;
+      p.x = nx; p.y = ny;
+      break;
+    }
+  }
+}
+
+// variable jump: apply the cut once, on release
+window.addEventListener('keyup', (e) => {
+  if ((e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') &&
+      player.vy < 0 && !player.inWater && player.wallLock <= 0) {
+    player.vy *= CFG.jumpCut;
+  }
+});
+
+// =============================================================
+// LEVELS — the black door carries you between them
+// =============================================================
+let currentLevel = 1;
+const levelSeeds = {};
+for (const k of [1, 2, 3, 4, 5, 6]) levelSeeds[k] = (Math.random() * 0x7fffffff) | 0;
+const doorMsg = { t: 0, text: '' }; // "the door refuses" message
+let transition = null; // { phase: 'out' | 'in', t }
+let runStart = performance.now();
+let winState = null; // { time, newBest } — set when you pass the Grassy Shrove's door
+let cactusWin = null; // { t } — the Cactus King has fallen
+let gameState = 'menu'; // 'menu' | 'play'
+let menuScreen = 'main'; // 'main' | 'help'
+let menuIndex = 0;
+let bestTime = null;
+try { const v = localStorage.getItem('lushcave-best'); if (v) bestTime = parseFloat(v); } catch (err) {}
+let showMap = false;
+let mapCanvas = null;
+let hatOn = false; // the mushroom hat (L)
+
+// =============================================================
+// MAP OVERLAY (M) — fully revealed for now; fog-of-war later
+// =============================================================
+function buildMapCanvas() {
+  const S = 2;
+  const c = document.createElement('canvas');
+  c.width = W * S; c.height = H * S;
+  const g = c.getContext('2d');
+  const airCol = lerpColor(PAL.stone, '#ffffff', 0.22);
+  const stoneCol = lerpColor(PAL.stoneDeep, '#000000', 0.45);
+  g.fillStyle = stoneCol;
+  g.fillRect(0, 0, c.width, c.height);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const t = world.tiles[y * W + x];
+      if (t === STONE) {
+        if (world.stickyMask[y * W + x]) { g.fillStyle = PAL.gooB; g.fillRect(x * S, y * S, S, S); }
+        continue;
+      }
+      g.fillStyle = t === WATER ? PAL.waterLine : airCol;
+      g.fillRect(x * S, y * S, S, S);
+    }
+  }
+  // glowing flora as bright specks
+  for (let x = 0; x < W; x++) {
+    for (const f of world.floraByCol[x]) {
+      if (!f.glow) continue;
+      g.fillStyle = PAL.mossGlow;
+      g.fillRect(f.x * S, f.y * S, 1, 1);
+    }
+  }
+  return c;
+}
+
+function drawMap(g, time) {
+  if (!showMap || !mapCanvas) return;
+  const mw = mapCanvas.width, mh = mapCanvas.height;
+  const x0 = (CFG.VIEW_W - mw) / 2, y0 = (CFG.VIEW_H - mh) / 2 + 12;
+  g.fillStyle = 'rgba(0,0,0,0.55)';
+  g.fillRect(0, 0, CFG.VIEW_W, CFG.VIEW_H);
+  g.fillStyle = 'rgba(8,12,14,0.95)';
+  g.fillRect(x0 - 12, y0 - 30, mw + 24, mh + 52);
+  g.fillStyle = PAL.title; // thin frame
+  g.fillRect(x0 - 12, y0 - 30, mw + 24, 1);
+  g.fillRect(x0 - 12, y0 + mh + 21, mw + 24, 1);
+  g.fillRect(x0 - 12, y0 - 30, 1, mh + 52);
+  g.fillRect(x0 + mw + 11, y0 - 30, 1, mh + 52);
+  g.font = '11px monospace';
+  g.textBaseline = 'top';
+  g.fillStyle = PAL.title;
+  g.fillText(PAL.name, x0, y0 - 22);
+  g.fillStyle = 'rgba(200,230,215,0.5)';
+  g.fillText('M close', x0 + mw - 50, y0 - 22);
+  g.imageSmoothingEnabled = false;
+  g.drawImage(mapCanvas, x0, y0);
+  // the doors, pulsing by kind; the key glints gold until taken
+  for (const d of world.doors || []) {
+    const st = DOOR_STYLES[d.kind] || DOOR_STYLES.black;
+    g.globalAlpha = 0.5 + 0.5 * Math.sin(time * 3);
+    g.fillStyle = d.kind === 'black' ? PAL.hintMossGlow : (st.rim || '#9a9aa4');
+    g.fillRect(x0 + d.x * 2 - 2, y0 + (d.y - 1) * 2 - 2, 8, 8);
+    g.globalAlpha = 1;
+    g.fillStyle = st.inner;
+    g.fillRect(x0 + d.x * 2 - 1, y0 + (d.y - 1) * 2 - 1, 6, 6);
+  }
+  if (world.key && !world.key.taken) {
+    g.globalAlpha = 0.6 + 0.4 * Math.sin(time * 5);
+    g.fillStyle = '#ffd44a';
+    g.fillRect(x0 + world.key.x * 2 - 2, y0 + world.key.y * 2 - 2, 5, 5);
+    g.globalAlpha = 1;
+  }
+  // you, blinking
+  const px = x0 + ((player.x + CFG.playerW / 2) / T) * 2;
+  const py = y0 + ((player.y + CFG.playerH / 2) / T) * 2;
+  g.fillStyle = '#000000';
+  g.fillRect(px - 3, py - 3, 7, 7);
+  g.globalAlpha = 0.8 + 0.2 * Math.sin(time * 8);
+  g.fillStyle = '#ffffff';
+  g.fillRect(px - 2, py - 2, 5, 5);
+  g.fillStyle = PAL.title;
+  g.fillRect(px - 1, py - 1, 3, 3);
+  g.globalAlpha = 1;
+}
+
+function checkDoor() {
+  if (transition || !world.doors) return;
+  const cx = player.x + CFG.playerW / 2, cy = player.y + CFG.playerH / 2;
+  for (const d of world.doors) {
+    if (!(cx >= d.x * T && cx <= (d.x + 2) * T &&
+          cy >= (d.y - 2) * T && cy <= (d.y + 1) * T)) continue;
+    if (d.kind === 'black' && world.key && !world.key.taken) {
+      doorMsg.t = 1.4; doorMsg.text = 'locked — find the key';
+      return;
+    }
+    if (world.boss && !world.boss.dead) {
+      doorMsg.t = 1.4; doorMsg.text = 'the cactus king bars the way';
+      return;
+    }
+    transition = { phase: 'out', t: 0, target: d.target };
+    return;
+  }
+}
+
+function updateTransition(dt) {
+  if (!transition) return;
+  transition.t += dt;
+  if (transition.phase === 'out' && transition.t >= 0.6) {
+    if (transition.target === 'win') { // the Shrove's black door — you win
+      const time = (performance.now() - runStart) / 1000;
+      const newBest = bestTime === null || time < bestTime;
+      if (newBest) {
+        bestTime = time;
+        try { localStorage.setItem('lushcave-best', String(time)); } catch (err) {}
+      }
+      winState = { time, newBest };
+      transition = null;
+      return;
+    }
+    currentLevel = transition.target;
+    generateWorld(levelSeeds[currentLevel], currentLevel);
+    resetPlayer();
+    particles.length = 0;
+    transition = { phase: 'in', t: 0 };
+  } else if (transition.phase === 'in' && transition.t >= 1.6) {
+    transition = null;
+  }
+}
+
+function fmtTime(s) {
+  const m = (s / 60) | 0;
+  const sec = s - m * 60;
+  return `${m}:${sec < 10 ? '0' : ''}${sec.toFixed(1)}`;
+}
+
+function startNewRun() {
+  winState = null;
+  for (const k of [1, 2, 3, 4, 5, 6]) levelSeeds[k] = (Math.random() * 0x7fffffff) | 0;
+  currentLevel = 1;
+  generateWorld(levelSeeds[1], 1);
+  resetPlayer();
+  particles.length = 0;
+  keys.clear();
+  runStart = performance.now();
+  transition = { phase: 'in', t: 0 };
+}
+
+const MENU_ITEMS = ['start', 'how to play'];
+const HELP_LINES = [
+  'A / D  ·  move',
+  'Space  ·  jump (hold for height); swim up',
+  'Shift  ·  dash 3 blocks (0.5s cooldown)',
+  'W / S  ·  climb big vines; swim',
+  'hold toward slimy walls to cling; jump to wall-jump',
+  'fall past a ledge to grab it; jump to mantle up',
+  'M  ·  map      L  ·  mushroom hat      R  ·  reroll level',
+  '',
+  'find the black door in each of the three caves.',
+  'do not linger in lava.',
+];
+
+function drawMenu(g, time) {
+  g.fillStyle = 'rgba(0,0,0,0.62)';
+  g.fillRect(0, 0, CFG.VIEW_W, CFG.VIEW_H);
+  g.textAlign = 'center';
+  const cx = CFG.VIEW_W / 2;
+  g.globalAlpha = 0.88 + 0.12 * Math.sin(time * 2);
+  g.font = 'bold 54px monospace';
+  g.fillStyle = THEMES[1].mossGlow;
+  g.fillText('LUSH CAVE', cx, 150);
+  g.globalAlpha = 1;
+  g.font = '14px monospace';
+  g.fillStyle = 'rgba(200,230,215,0.75)';
+  g.fillText('a journey through three doors', cx, 182);
+
+  if (menuScreen === 'help') {
+    g.font = '14px monospace';
+    g.fillStyle = '#d8e6dc';
+    HELP_LINES.forEach((line, i) => g.fillText(line, cx, 250 + i * 24));
+    g.font = '12px monospace';
+    g.fillStyle = 'rgba(200,230,215,0.55)';
+    g.fillText('Space — back', cx, 250 + HELP_LINES.length * 24 + 20);
+  } else {
+    MENU_ITEMS.forEach((item, i) => {
+      const y = 280 + i * 44;
+      if (i === menuIndex) {
+        g.fillStyle = 'rgba(157,255,176,0.12)';
+        g.fillRect(cx - 130, y - 22, 260, 32);
+        g.fillStyle = THEMES[1].mossGlow;
+        g.font = 'bold 20px monospace';
+      } else {
+        g.fillStyle = 'rgba(216,230,220,0.7)';
+        g.font = '20px monospace';
+      }
+      g.fillText(item, cx, y);
+    });
+    if (bestTime !== null) {
+      g.font = '13px monospace';
+      g.fillStyle = THEMES[1].capA;
+      g.fillText(`best time  ${fmtTime(bestTime)}`, cx, 402);
+    }
+    g.font = '12px monospace';
+    g.fillStyle = 'rgba(200,230,215,0.55)';
+    g.fillText('W/S — choose · Space — confirm', cx, 440);
+  }
+  g.textAlign = 'left';
+}
+
+function drawCactusWin(g, time) {
+  if (!cactusWin) return;
+  const a = Math.min(1, cactusWin.t / 0.5);
+  g.fillStyle = `rgba(6,14,4,${(a * 0.88).toFixed(3)})`;
+  g.fillRect(0, 0, CFG.VIEW_W, CFG.VIEW_H);
+  const cx = CFG.VIEW_W / 2;
+  g.globalAlpha = a;
+  // the fallen king: slumped body, purple aura fading, crown toppled beside him
+  const bx = cx - 18, by = 150;
+  g.globalAlpha = a * (0.35 + 0.2 * Math.sin(time * 2));
+  g.fillStyle = '#b06ce8';
+  g.fillRect(bx - 4, by - 4, 44, 76);
+  g.globalAlpha = a;
+  g.fillStyle = '#3f6b2f';
+  g.fillRect(bx, by, 36, 68);
+  g.fillStyle = '#5c8f44';
+  g.fillRect(bx + 6, by + 2, 4, 66);
+  g.fillRect(bx + 26, by + 2, 4, 66);
+  g.fillStyle = '#1e3a16';                              // eyes gone crossed-out
+  g.fillRect(bx + 8, by + 16, 8, 2);
+  g.fillRect(bx + 11, by + 13, 2, 8);
+  g.fillRect(bx + 20, by + 16, 8, 2);
+  g.fillRect(bx + 23, by + 13, 2, 8);
+  g.fillStyle = '#ffd44a';                              // the crown, toppled
+  g.fillRect(bx + 44, by + 58, 14, 5);
+  g.fillRect(bx + 46, by + 52, 4, 6);
+  g.fillRect(bx + 53, by + 54, 4, 4);
+  g.textAlign = 'center';
+  g.font = 'bold 34px monospace';
+  g.fillStyle = '#b8e88a';
+  g.fillText('THE CACTUS KING FALLS', cx, 280);
+  g.font = '14px monospace';
+  g.fillStyle = '#d8f2a0';
+  g.fillText('the needle throne stands empty — the way is open', cx, 312);
+  g.font = '13px monospace';
+  g.fillStyle = 'rgba(216,242,160,0.6)';
+  g.fillText('Space — continue', cx, 352);
+  g.textAlign = 'left';
+  g.globalAlpha = 1;
+}
+
+function drawWin(g, time) {
+  if (!winState) return;
+  g.fillStyle = 'rgba(0,0,0,0.93)';
+  g.fillRect(0, 0, CFG.VIEW_W, CFG.VIEW_H);
+  g.textAlign = 'center';
+  g.globalAlpha = 0.85 + 0.15 * Math.sin(time * 2.5);
+  g.font = 'bold 52px monospace';
+  g.fillStyle = THEMES[3].title;
+  g.fillText('YOU WIN', CFG.VIEW_W / 2, CFG.VIEW_H / 2 - 60);
+  g.globalAlpha = 1;
+  g.font = '16px monospace';
+  g.fillStyle = '#d8e6dc';
+  g.fillText('you found your way through all three doors', CFG.VIEW_W / 2, CFG.VIEW_H / 2 - 10);
+  g.font = 'bold 26px monospace';
+  g.fillStyle = THEMES[1].capA;
+  g.fillText(fmtTime(winState.time), CFG.VIEW_W / 2, CFG.VIEW_H / 2 + 30);
+  if (winState.newBest) {
+    g.globalAlpha = 0.75 + 0.25 * Math.sin(time * 5);
+    g.font = 'bold 15px monospace';
+    g.fillStyle = '#ffe88a';
+    g.fillText('new best!', CFG.VIEW_W / 2, CFG.VIEW_H / 2 + 52);
+    g.globalAlpha = 1;
+  }
+  g.font = '13px monospace';
+  g.fillStyle = 'rgba(200,230,215,0.6)';
+  g.fillText('Space — play again · Esc — menu', CFG.VIEW_W / 2, CFG.VIEW_H / 2 + 82);
+  g.textAlign = 'left';
+}
+
+function drawTransition(g) {
+  if (!transition) return;
+  const a = transition.phase === 'out'
+    ? Math.min(1, transition.t / 0.6)
+    : Math.max(0, 1 - transition.t / 1.0);
+  g.fillStyle = `rgba(0,0,0,${a.toFixed(3)})`;
+  g.fillRect(0, 0, CFG.VIEW_W, CFG.VIEW_H);
+  if (transition.phase === 'in') {
+    const ta = Math.sin(Math.min(1, transition.t / 1.6) * Math.PI);
+    g.globalAlpha = ta;
+    g.font = 'bold 30px monospace';
+    g.textAlign = 'center';
+    g.fillStyle = PAL.title;
+    g.fillText(PAL.name, CFG.VIEW_W / 2, CFG.VIEW_H / 2 - 40);
+    g.textAlign = 'left';
+    g.globalAlpha = 1;
+  }
+}
+
+// =============================================================
+// THE GREAT WATERFALL — a full-width cascade into its plunge pool
+// =============================================================
+function updateWaterfall(dt) {
+  const wf = world.waterfall;
+  if (!wf) return;
+  const p = player;
+  // the curtain shoves you downward
+  if (p.x + CFG.playerW > wf.x * T && p.x < (wf.x + wf.w) * T &&
+      p.y + CFG.playerH > wf.top * T && p.y < wf.bot * T &&
+      !p.hanging && !p.climbing) {
+    p.vy = Math.min(p.vy + 500 * dt, p.inWater ? 120 : CFG.maxFall);
+  }
+  // mist boils off the pool
+  if (Math.random() < 0.35 && particles.length < CFG.maxParticles - 10) {
+    spawnParticle({
+      type: 'mist',
+      x: wf.x * T + Math.random() * wf.w * T,
+      y: wf.bot * T - 2,
+      vx: (Math.random() - 0.5) * 50,
+      vy: -30 - Math.random() * 50,
+      life: 0.7,
+    });
+  }
+}
+
+function drawWaterfall(g, time, camIX, camIY) {
+  const wf = world.waterfall;
+  if (!wf) return;
+  const x0 = wf.x * T - camIX, y0 = wf.top * T - camIY;
+  const wpx = wf.w * T, hpx = (wf.bot - wf.top) * T;
+  if (x0 > CFG.VIEW_W || x0 + wpx < 0 || y0 > CFG.VIEW_H || y0 + hpx < 0) return;
+  g.globalAlpha = 0.16;                                  // the sheet
+  g.fillStyle = PAL.waterTint;
+  g.fillRect(x0, y0, wpx, hpx);
+  g.globalAlpha = 0.35;                                  // scrolling streaks
+  g.fillStyle = PAL.waterLine;
+  const scroll = (time * 240) % 26;
+  for (let sx = 0; sx < wf.w; sx++) {
+    const px = x0 + sx * T + 2 + ((sx * 7) % 9);
+    for (let k = -1; k < hpx / 26 + 1; k++) {
+      const py = y0 + k * 26 + scroll + ((sx * 13) % 19);
+      const top = Math.max(py, y0), bot = Math.min(py + 15, y0 + hpx);
+      if (bot > top) g.fillRect(px, top, 3, bot - top);
+    }
+  }
+  g.globalAlpha = 0.45 + 0.1 * Math.sin(time * 6);       // foam at the plunge
+  g.fillStyle = '#ffffff';
+  for (let sx = 0; sx < wf.w; sx++) {
+    g.fillRect(x0 + sx * T + 1, y0 + hpx - 2 + ((sx * 5) % 3), 11, 3);
+  }
+  g.globalAlpha = 1;
+}
+
+// =============================================================
+// THE VOLCANO — erupts on a timer; the bombs are not decorative
+// =============================================================
+function updateVolcano(dt) {
+  const v = world.volcano;
+  if (!v) return;
+  v.t -= dt;
+  if (v.t <= 0) { // eruption — a full-throated one
+    v.t = 3 + Math.random() * 1.5;
+    const ox = v.craterX * T, oy = v.craterY * T;
+    for (let i = 0; i < 30; i++) {
+      world.bombs.push({
+        x: ox + Math.random() * 16 - 4,
+        y: oy - 2,
+        vx: (Math.random() - 0.5) * 280,
+        vy: -260 - Math.random() * 220,
+        life: 5,
+      });
+    }
+  }
+  // ember sputter between eruptions
+  if (Math.random() < 0.5 && particles.length < CFG.maxParticles - 10) {
+    spawnParticle({
+      type: 'spore', hint: 0,
+      x: v.craterX * T + Math.random() * 16 - 4,
+      y: v.craterY * T - 2,
+      vy: -(20 + Math.random() * 30),
+      phase: Math.random() * 6.3, size: 2, life: 1.2,
+    });
+  }
+}
+
+function updateBombs(dt) {
+  const p = player;
+  for (let i = world.bombs.length - 1; i >= 0; i--) {
+    const b = world.bombs[i];
+    b.vy += 700 * dt;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    const t = tileAt(Math.floor(b.x / T), Math.floor(b.y / T));
+    if (b.life <= 0 || t === STONE || (t === WATER && b.vy > 0)) {
+      for (let k = 0; k < 6; k++) {
+        spawnParticle({ type: 'splash', x: b.x, y: b.y - 2, vx: (Math.random() - 0.5) * 90, vy: -40 - Math.random() * 60, life: 0.35 });
+      }
+      world.bombs.splice(i, 1);
+      continue;
+    }
+    if (!transition && !winState &&
+        p.x < b.x + 5 && p.x + CFG.playerW > b.x - 5 &&
+        p.y < b.y + 5 && p.y + CFG.playerH > b.y - 5) {
+      world.bombs.splice(i, 1);
+      hazardDeath();
+    }
+  }
+}
+
+function drawBombs(g, camIX, camIY) { // drawn above the darkness: molten rock glows
+  for (const b of world.bombs) {
+    const sx = Math.round(b.x - camIX), sy = Math.round(b.y - camIY);
+    if (sx < -10 || sx > CFG.VIEW_W + 10 || sy < -10 || sy > CFG.VIEW_H + 10) continue;
+    g.fillStyle = '#ff6a26';
+    g.fillRect(sx - 3, sy - 3, 6, 6);
+    g.fillStyle = '#ffcf7d';
+    g.fillRect(sx - 1, sy - 1, 3, 3);
+  }
+}
+
+// =============================================================
+// THE KEY — glints in the dark; the black door won't open without it
+// =============================================================
+function keyPos(time) {
+  const k = world.key;
+  return { x: k.x * T + 8, y: k.y * T + 8 + Math.sin(time * 2) * 3 };
+}
+
+function updateKey(time) {
+  const k = world.key;
+  if (!k || k.taken || transition || winState) return;
+  const { x, y } = keyPos(time);
+  if (player.x < x + 6 && player.x + CFG.playerW > x - 6 &&
+      player.y < y + 6 && player.y + CFG.playerH > y - 6) {
+    k.taken = true;
+    for (let i = 0; i < 14; i++) {
+      spawnParticle({ type: 'spore', hint: 0, x: x + (Math.random() - 0.5) * 10, y: y + (Math.random() - 0.5) * 10, vy: -14 - Math.random() * 24, phase: Math.random() * 6.3, size: 2, life: 1.1 });
+    }
+  }
+}
+
+function drawKey(g, time, camIX, camIY) { // drawn above the darkness: it glints
+  const k = world.key;
+  if (!k || k.taken) return;
+  const { x, y } = keyPos(time);
+  const sx = Math.round(x - camIX), sy = Math.round(y - camIY);
+  if (sx < -20 || sx > CFG.VIEW_W + 20 || sy < -20 || sy > CFG.VIEW_H + 20) return;
+  g.globalAlpha = 0.22 + 0.14 * Math.sin(time * 3);
+  g.fillStyle = '#ffe88a';
+  g.fillRect(sx - 8, sy - 8, 16, 16);            // halo
+  g.globalAlpha = 1;
+  g.fillStyle = '#ffd44a';
+  g.fillRect(sx - 6, sy - 3, 6, 6);              // bow
+  g.fillStyle = '#8a6d1a';
+  g.fillRect(sx - 4, sy - 1, 2, 2);              // bow hole
+  g.fillStyle = '#ffd44a';
+  g.fillRect(sx, sy - 1, 7, 2);                  // shaft
+  g.fillRect(sx + 3, sy + 1, 2, 2);              // teeth
+  g.fillRect(sx + 6, sy + 1, 2, 3);
+}
+
+// =============================================================
+// CRABS — goomba-hearted floor patrollers
+// =============================================================
+function updateCrabs(dt, time) {
+  const p = player;
+  for (const c of world.crabs) {
+    if (c.dead) continue;
+    if (c.squash > 0) {
+      c.squash -= dt;
+      if (c.squash <= 0) c.dead = true;
+      continue;
+    }
+    // patrol: turn at walls, ledges, and water
+    const nx = c.x + c.dir * CFG.crabSpeed * dt;
+    const frontX = c.dir > 0 ? nx + 14 : nx;
+    const ftx = Math.floor(frontX / T);
+    const bodyTy = Math.floor((c.y + 5) / T);
+    const floorTy = Math.floor((c.y + 11) / T);
+    if (isSolid(ftx, bodyTy) || !isSolid(ftx, floorTy) || tileAt(ftx, bodyTy) === WATER) {
+      c.dir *= -1;
+    } else {
+      c.x = nx;
+    }
+    // player contact
+    if (transition || winState) continue;
+    if (p.hanging) {
+      // hanging tucks your body against the wall — but your hand is on the lip,
+      // and a crab scuttling over it kicks you off
+      const hx = p.hangDir > 0 ? p.x + CFG.playerW : p.x - 5;
+      const hy = p.y - 2;
+      if (hx < c.x + 14 && hx + 5 > c.x && hy < c.y + 10 && hy + 6 > c.y) {
+        p.hanging = false;
+        p.hangCd = 0.5;                 // fingers smart for a moment — no instant regrab
+        p.vx = -p.hangDir * 160;        // shoved off the wall
+        p.vy = 130;
+        for (let i = 0; i < 4; i++) {
+          spawnParticle({ type: 'splash', x: hx + 2, y: hy, vx: (Math.random() - 0.5) * 90, vy: -40 - Math.random() * 50, life: 0.3 });
+        }
+      }
+      continue;
+    }
+    const yOverlap = p.y < c.y + 10 && p.y + CFG.playerH > c.y;
+    const overlap = yOverlap && p.x < c.x + 14 && p.x + CFG.playerW > c.x;
+    // stomps get a slightly wider box than lethal contact — forgiving landings
+    const stompOverlap = yOverlap && p.x < c.x + 14 + CFG.crabStompPad &&
+                         p.x + CFG.playerW > c.x - CFG.crabStompPad;
+    if (p.vy > 60 && p.y + CFG.playerH < c.y + 7 && stompOverlap) { // stomped from above
+      c.squash = 0.35;
+      p.vy = CFG.crabBounce;
+      continue;
+    }
+    if (!overlap) continue;
+    if (p.dashTimer > 0) { // dashed straight through it
+      c.squash = 0.35;
+      continue;
+    }
+    // side contact: the crab gets you — red pulse, back to the level start
+    hazardDeath();
+    return;
+  }
+}
+
+function drawCrabs(g, time, camIX, camIY) {
+  for (const c of world.crabs) {
+    if (c.dead) continue;
+    const sx = Math.round(c.x - camIX), sy = Math.round(c.y - camIY);
+    if (sx < -20 || sx > CFG.VIEW_W + 20 || sy < -20 || sy > CFG.VIEW_H + 20) continue;
+    if (c.squash > 0) { // flattened
+      g.globalAlpha = c.squash / 0.35;
+      g.fillStyle = '#a33827';
+      g.fillRect(sx, sy + 7, 14, 3);
+      g.globalAlpha = 1;
+      continue;
+    }
+    const scuttle = Math.sin(time * 12 + c.x * 0.2) > 0 ? 1 : 0;
+    g.fillStyle = '#a33827';                        // claws + legs
+    g.fillRect(sx - 2, sy + 2, 3, 3);
+    g.fillRect(sx + 13, sy + 2, 3, 3);
+    g.fillRect(sx + (scuttle ? 1 : 2), sy + 8, 3, 2);
+    g.fillRect(sx + 6, sy + 8, 2, 2);
+    g.fillRect(sx + (scuttle ? 10 : 9), sy + 8, 3, 2);
+    g.fillStyle = '#e85d4a';                        // shell
+    g.fillRect(sx + 1, sy + 2, 12, 6);
+    g.fillRect(sx + 3, sy, 8, 3);
+    g.fillStyle = '#ffffff';                        // eyes on stalks
+    g.fillRect(sx + 4, sy - 1, 2, 3);
+    g.fillRect(sx + 8, sy - 1, 2, 3);
+    g.fillStyle = '#1a0d0a';
+    g.fillRect(sx + 4 + (c.dir > 0 ? 1 : 0), sy - 1, 1, 2);
+    g.fillRect(sx + 8 + (c.dir > 0 ? 1 : 0), sy - 1, 1, 2);
+  }
+}
+
+// =============================================================
+// CAMERA
+// =============================================================
+const cam = { x: 0, y: 0 };
+function clampCam() {
+  cam.x = Math.max(0, Math.min(W * T - CFG.VIEW_W, cam.x));
+  cam.y = Math.max(0, Math.min(H * T - CFG.VIEW_H, cam.y));
+}
+function updateCamera(dt) {
+  const tx = player.x + CFG.playerW / 2 - CFG.VIEW_W / 2;
+  const ty = player.y + CFG.playerH / 2 - CFG.VIEW_H / 2;
+  const k = 1 - Math.pow(0.001, dt);
+  cam.x += (tx - cam.x) * k;
+  cam.y += (ty - cam.y) * k;
+  clampCam();
+}
+
+// =============================================================
+// PARTICLES
+// =============================================================
+const particles = [];
+function spawnParticle(p) {
+  if (particles.length < CFG.maxParticles) {
+    p.age = 0;
+    particles.push(p);
+  }
+}
+
+function updateParticles(dt, time, camIX, camIY) {
+  // drips fire from visible drip points
+  const tx0 = (camIX / T | 0) - 2, tx1 = ((camIX + CFG.VIEW_W) / T | 0) + 2;
+  const ty0 = (camIY / T | 0) - 2, ty1 = ((camIY + CFG.VIEW_H) / T | 0) + 2;
+  for (const d of world.dripPoints) {
+    if (d.x < tx0 || d.x > tx1 || d.y < ty0 || d.y > ty1) continue;
+    if (time > d.next) {
+      d.next = time + 2 + Math.random() * 4;
+      spawnParticle({ type: 'drip', x: d.x * T + 6 + Math.random() * 4, y: d.y * T + 1, vy: 0, life: 6 });
+    }
+  }
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.age += dt;
+    let dead = p.age > p.life;
+
+    if (p.type === 'spore') {
+      p.x += (Math.sin(time * 0.8 + p.phase) * 6 + (p.hint || 0) * 9) * dt;
+      p.y += p.vy * dt;
+      if (tileAt(p.x / T | 0, p.y / T | 0) === STONE) dead = true;
+    } else if (p.type === 'drip') {
+      if (p.age > 0.4) { // cling, then fall
+        p.vy = Math.min(p.vy + CFG.gravity * dt, CFG.maxFall);
+        p.y += p.vy * dt;
+        const t = tileAt(p.x / T | 0, p.y / T | 0);
+        if (t === STONE || t === WATER) {
+          dead = true;
+          for (let s = 0; s < 3; s++) {
+            spawnParticle({ type: 'splash', x: p.x, y: p.y - 2, vx: (Math.random() - 0.5) * 60, vy: -40 - Math.random() * 40, life: 0.3 });
+          }
+        }
+      }
+    } else if (p.type === 'splash') {
+      p.vy += CFG.gravity * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+    } else if (p.type === 'bubble') {
+      p.y += p.vy * dt;
+      p.x += Math.sin(time * 4 + p.y * 0.1) * 8 * dt;
+      if (tileAt(p.x / T | 0, p.y / T | 0) !== WATER) dead = true; // pop at surface
+    } else if (p.type === 'mist') {
+      p.vy += 160 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+    }
+
+    if (dead) {
+      particles[i] = particles[particles.length - 1];
+      particles.pop();
+    }
+  }
+}
+
+function drawParticles(g, camIX, camIY, glowLayer) {
+  for (const p of particles) {
+    const isGlow = p.type === 'spore';
+    if (isGlow !== glowLayer) continue;
+    const sx = p.x - camIX, sy = p.y - camIY;
+    if (sx < -4 || sx > CFG.VIEW_W + 4 || sy < -4 || sy > CFG.VIEW_H + 4) continue;
+    if (p.type === 'spore') {
+      g.globalAlpha = Math.sin(Math.PI * p.age / p.life) * 0.8;
+      g.fillStyle = p.hint ? PAL.hintSpore : PAL.spore;
+      g.fillRect(sx, sy, p.size, p.size);
+    } else if (p.type === 'drip') {
+      g.globalAlpha = 0.9;
+      g.fillStyle = PAL.waterLine;
+      const stretch = p.age < 0.4 ? 1 + p.age * 5 : 3;
+      g.fillRect(sx, sy, 1, stretch);
+    } else if (p.type === 'splash') {
+      g.globalAlpha = 0.8 * (1 - p.age / p.life);
+      g.fillStyle = PAL.waterLine;
+      g.fillRect(sx, sy, 1, 1);
+    } else if (p.type === 'bubble') {
+      g.globalAlpha = 0.6;
+      g.fillStyle = PAL.bubble;
+      g.fillRect(sx, sy, 2, 2);
+    } else if (p.type === 'mist') { // waterfall spray
+      g.globalAlpha = Math.max(0, 1 - p.age / p.life) * 0.45;
+      g.fillStyle = '#e8f6fc';
+      g.fillRect(sx, sy, 2, 2);
+    } else if (p.type === 'ghost') { // dash afterimage
+      g.globalAlpha = Math.max(0, 1 - p.age / p.life) * 0.35;
+      g.fillStyle = PAL.body;
+      g.fillRect(sx, sy, CFG.playerW, CFG.playerH);
+    }
+  }
+  g.globalAlpha = 1;
+}
+
+// =============================================================
+// FLORA DRAWING (animated, per frame)
+// =============================================================
+function drawFlora(g, time, dt, camIX, camIY) {
+  const x0 = Math.max(0, (camIX / T | 0) - 2);
+  const x1 = Math.min(W - 1, ((camIX + CFG.VIEW_W) / T | 0) + 2);
+  const y0 = camIY / T - 3, y1 = (camIY + CFG.VIEW_H) / T + 3;
+
+  for (let x = x0; x <= x1; x++) {
+    for (const f of world.floraByCol[x]) {
+      if (f.y < y0 - (f.len || 0) || f.y > y1 + (f.len || 0)) continue;
+      const px = f.x * T - camIX, py = f.y * T - camIY;
+      const pulse = f.glow ? 0.75 + 0.25 * Math.sin(time * 2 + f.phase) : 1;
+      const cap = (f.variant & 1) ? PAL.capA : PAL.capB;
+
+      if (f.type === 'grass') {
+        // spring: pushed by the player wading through, oscillates back
+        const overlap = player.x < (f.x + 1) * T && player.x + CFG.playerW > f.x * T &&
+                        player.y + CFG.playerH > f.y * T + 4 && player.y < (f.y + 1) * T;
+        if (overlap && Math.abs(player.vx) > 20) {
+          f.bendVel = player.vx * 0.06;
+        }
+        f.bend += f.bendVel * dt;
+        f.bendVel += (-f.bend * 45 - f.bendVel * 5.5) * dt;
+        if (f.bend > 7) f.bend = 7; else if (f.bend < -7) f.bend = -7;
+        const ambient = Math.sin(time * 1.3 + f.phase) * 0.8;
+        const tip = f.bend + ambient;
+        for (let b = 0; b < f.blades; b++) {
+          const bx = px + 2 + ((f.variant >> (b * 3)) % 5) + b * 4;
+          const bh = f.height - ((f.variant >> (b * 2)) % 3);
+          g.fillStyle = lerpColor(PAL.mossA, PAL.mossB, ((f.variant >> b) % 8) / 8);
+          g.fillRect(bx, py + T - (bh >> 1), 1, bh >> 1);          // rooted lower half
+          g.fillRect(bx + tip * 0.5, py + T - bh, 1, bh - (bh >> 1)); // swaying upper half
+          g.fillStyle = PAL.leaf;
+          g.fillRect(bx + tip, py + T - bh - 1, 1, 2);             // tip
+        }
+      } else if (f.type === 'tramp') {
+        if (f.springT > 0) f.springT = Math.max(0, f.springT - dt);
+        const prog = 1 - f.springT / 0.35;
+        const squish = f.springT > 0 ? 1 - 0.5 * Math.sin(prog * Math.PI) : 1;
+        const cx3 = px + 8;
+        const base = py + T;
+        const capH = Math.round(10 * squish);
+        const capY = base - 14 - capH;
+        g.fillStyle = PAL.stem;                               // thick stem
+        g.fillRect(cx3 - 3, base - 14, 6, 14);
+        g.fillStyle = '#ff6fa8';                              // springy pink cap
+        g.fillRect(cx3 - 20, capY, 40, capH);
+        g.fillRect(cx3 - 14, capY - 2, 28, 2);
+        g.fillStyle = '#ffffff';                              // polka dots
+        g.fillRect(cx3 - 14 + (f.variant % 7), capY + 2, 3, 3);
+        g.fillRect(cx3 + 2 + (f.variant % 9), capY + capH - 5, 3, 3);
+        g.fillRect(cx3 - 6, capY - 1, 2, 2);
+        g.fillStyle = '#d84a86';                              // underside
+        g.fillRect(cx3 - 20, capY + capH - 1, 40, 1);
+      } else if (f.type === 'cactus') {
+        const ch = f.height;
+        const cx2 = px + 6;
+        g.fillStyle = '#3f6b2f';                              // trunk
+        g.fillRect(cx2, py + T - ch, 5, ch);
+        g.fillStyle = '#5c8f44';
+        g.fillRect(cx2 + 1, py + T - ch, 2, ch);              // highlight rib
+        g.fillStyle = '#e8f2c4';                              // needles
+        g.fillRect(cx2 - 1, py + T - ch + 2 + (f.variant % 5), 1, 1);
+        g.fillRect(cx2 + 5, py + T - ch + 5 + (f.variant % 4), 1, 1);
+        if (f.arms && ch > 14) {                              // one arm each side
+          g.fillStyle = '#3f6b2f';
+          g.fillRect(cx2 - 4, py + T - ch + 5, 4, 3);
+          g.fillRect(cx2 - 4, py + T - ch + 1, 3, 5);
+          g.fillRect(cx2 + 5, py + T - ch + 8, 4, 3);
+          g.fillRect(cx2 + 6, py + T - ch + 4, 3, 5);
+        }
+      } else if (f.type === 'mush') {
+        const s = f.size;
+        const stemH = Math.max(4, Math.round(10 * s));
+        const stemW = s >= 1.5 ? 4 : 2;
+        const capW = Math.round(Math.min(9 * s + 3, s >= 1.5 ? 28 : 14));
+        const capH = Math.max(2, Math.round(3 * s));
+        const topH = Math.max(1, Math.round(capH * 0.5));
+        const cx = px + 8;
+        const baseY = py + T; // rooted at the floor line
+        g.fillStyle = PAL.stem;
+        g.fillRect(cx - stemW / 2, baseY - stemH, stemW, stemH);
+        g.globalAlpha = pulse;
+        g.fillStyle = cap;
+        const capY = baseY - stemH - capH;
+        g.fillRect(cx - capW / 2, capY, capW, capH);
+        g.fillRect(cx - Math.round(capW * 0.35), capY - topH, Math.round(capW * 0.7), topH);
+        g.globalAlpha = 1;
+        if (capW >= 10) { // gill dots on the bigger caps
+          g.fillStyle = '#ffffff33';
+          g.fillRect(cx - capW / 2 + 2 + (f.variant % (capW - 6)), capY + 1, 2, 2);
+          if (capW >= 20) g.fillRect(cx + capW / 4, capY + capH - 2, 2, 2);
+        }
+      } else if (f.type === 'bigvine') {
+        for (let k = 0; k < f.len; k++) {
+          const sway = Math.sin(time * 0.9 + f.phase + k * 0.25) * 1.2 * k / f.len;
+          const vx = px + 5 + sway;
+          g.fillStyle = PAL.bigA;
+          g.fillRect(vx, py + k * T, 6, T);
+          g.fillStyle = PAL.bigB;
+          g.fillRect(vx + 1, py + k * T, 2, T);
+          g.fillStyle = PAL.leaf; // leaf pairs, alternating sides
+          if (k % 2 === 0) g.fillRect(vx - 3, py + k * T + 4, 3, 2);
+          else g.fillRect(vx + 6, py + k * T + 9, 3, 2);
+          if (f.glow && k === ((f.len / 2) | 0)) {
+            g.globalAlpha = pulse;
+            g.fillStyle = PAL.vineGlow;
+            g.fillRect(vx + 1, py + k * T + 6, 4, 4);
+            g.globalAlpha = 1;
+          }
+        }
+      } else if (f.type === 'vine') {
+        for (let k = 0; k < f.len; k++) {
+          const sway = Math.sin(time * 1.5 + f.phase + k * 0.5) * 1.5 * (k + 1) / f.len;
+          const tip = k === f.len - 1;
+          g.fillStyle = (tip && f.glow) ? PAL.vineGlow : PAL.vine;
+          if (tip && f.glow) g.globalAlpha = pulse;
+          g.fillRect(px + 6.5 + sway, py + k * T, 3, T);
+          g.globalAlpha = 1;
+          // leaf nubs
+          if ((f.variant >> k) & 1) {
+            g.fillStyle = PAL.vine;
+            g.fillRect(px + 9.5 + sway, py + k * T + 5, 2, 2);
+          } else {
+            g.fillStyle = PAL.vine;
+            g.fillRect(px + 4.5 + sway, py + k * T + 9, 2, 2);
+          }
+        }
+      }
+    }
+  }
+}
+
+// =============================================================
+// ENTRANCE — stone-framed doorway; its void stays black under any light
+// =============================================================
+const DOOR_STYLES = {
+  black:  { inner: '#000000', rim: null /* theme doorRim */ },
+  grey:   { inner: '#585862', rim: '#9a9aa4' },
+  sand:   { inner: '#caa96b', rim: '#ffe8a0' },
+  cactus: { inner: '#3f6b2f', rim: '#b06ce8' },
+};
+
+// =============================================================
+// SPIKES — the cactus temple's hazard; they don't move, you do
+// =============================================================
+function hazardDeath() { // shared: crab bite, spike, needle, boss contact
+  scorchFlash = 0.9;
+  for (let i = 0; i < 10; i++) {
+    spawnParticle({ type: 'splash', x: player.x + Math.random() * CFG.playerW, y: player.y + Math.random() * CFG.playerH, vx: (Math.random() - 0.5) * 120, vy: -50 - Math.random() * 70, life: 0.4 });
+  }
+  resetPlayer();
+}
+
+function updateSpikes() {
+  if (transition || winState || !world.spikes.length) return;
+  const p = player;
+  for (const s of world.spikes) {
+    const sx = s.x * T + 2, sy = s.y * T + 6;
+    if (p.x < sx + 12 && p.x + CFG.playerW > sx && p.y < sy + 10 && p.y + CFG.playerH > sy) {
+      hazardDeath();
+      return;
+    }
+  }
+}
+
+// =============================================================
+// GRASSHOPPERS — they hop, they bite, they never leave home
+// =============================================================
+function updateHoppers(dt, time) {
+  const p = player;
+  for (const h of world.hoppers) {
+    if (h.dead) continue;
+    if (h.squash > 0) {
+      h.squash -= dt;
+      if (h.squash <= 0) h.dead = true;
+      continue;
+    }
+    if (!h.grounded) {
+      h.vy += 1200 * dt;
+      h.y += h.vy * dt;
+      h.x += h.vx * dt;
+      if (h.x < h.minX) { h.x = h.minX; h.vx = Math.abs(h.vx); }   // platform-bound for life
+      if (h.x > h.maxX) { h.x = h.maxX; h.vx = -Math.abs(h.vx); }
+      const ctx2 = Math.floor((h.x + 6) / T);
+      if (h.vy < 0 && isSolid(ctx2, Math.floor(h.y / T))) {        // head bump
+        h.y = (Math.floor(h.y / T) + 1) * T + 0.1;
+        h.vy = 0;
+      }
+      const feetTy = Math.floor((h.y + 10) / T);
+      if (h.vy > 0 && isSolid(ctx2, feetTy)) {                     // land
+        h.y = feetTy * T - 10;
+        h.vy = 0; h.vx = 0;
+        h.grounded = true;
+      }
+    } else {
+      h.t -= dt;
+      if (h.t <= 0) { // hop!
+        h.t = 1.2 + Math.random() * 1.4;
+        h.dir = Math.random() < 0.5 ? -1 : 1;
+        h.vy = CFG.hopperJumpVy;
+        h.vx = h.dir * (30 + Math.random() * 55);
+        h.grounded = false;
+      }
+    }
+    // player contact — same law as crabs
+    if (transition || winState) continue;
+    const yOverlap = p.y < h.y + 10 && p.y + CFG.playerH > h.y;
+    const overlap = yOverlap && p.x < h.x + 12 && p.x + CFG.playerW > h.x;
+    const stompOverlap = yOverlap && p.x < h.x + 12 + CFG.crabStompPad &&
+                         p.x + CFG.playerW > h.x - CFG.crabStompPad;
+    if (p.vy > 60 && p.y + CFG.playerH < h.y + 7 && stompOverlap) {
+      h.squash = 0.35;
+      p.vy = CFG.crabBounce;
+      continue;
+    }
+    if (!overlap) continue;
+    if (p.dashTimer > 0) { h.squash = 0.35; continue; }
+    hazardDeath();
+    return;
+  }
+}
+
+function drawHoppers(g, time, camIX, camIY) {
+  for (const h of world.hoppers) {
+    if (h.dead) continue;
+    const sx = Math.round(h.x - camIX), sy = Math.round(h.y - camIY);
+    if (sx < -20 || sx > CFG.VIEW_W + 20 || sy < -20 || sy > CFG.VIEW_H + 20) continue;
+    if (h.squash > 0) {
+      g.globalAlpha = h.squash / 0.35;
+      g.fillStyle = '#4a8a2a';
+      g.fillRect(sx, sy + 7, 12, 3);
+      g.globalAlpha = 1;
+      continue;
+    }
+    const air = !h.grounded;
+    g.fillStyle = '#4a8a2a';                        // big rear legs
+    if (air) { // legs kicked out
+      g.fillRect(sx - 2, sy + 6, 4, 2);
+      g.fillRect(sx + 10, sy + 6, 4, 2);
+    } else {   // legs folded, ready
+      g.fillRect(sx - 1, sy + 4, 3, 2);
+      g.fillRect(sx - 2, sy + 6, 2, 4);
+      g.fillRect(sx + 10, sy + 4, 3, 2);
+      g.fillRect(sx + 12, sy + 6, 2, 4);
+    }
+    g.fillStyle = '#7dd44a';                        // body
+    g.fillRect(sx, sy + 2, 12, 6);
+    g.fillRect(sx + 2, sy, 8, 3);
+    g.fillStyle = '#a8e87d';                        // belly stripe
+    g.fillRect(sx + 1, sy + 6, 10, 1);
+    g.fillStyle = '#2a4a16';                        // antennae
+    g.fillRect(sx + (h.dir > 0 ? 10 : 0), sy - 3, 1, 3);
+    g.fillRect(sx + (h.dir > 0 ? 12 : -2), sy - 4, 1, 3);
+    g.fillStyle = '#ffffff';                        // eye
+    g.fillRect(sx + (h.dir > 0 ? 8 : 2), sy + 1, 2, 2);
+    g.fillStyle = '#1a2a0d';
+    g.fillRect(sx + (h.dir > 0 ? 9 : 2), sy + 1, 1, 2);
+  }
+}
+
+// =============================================================
+// THE CACTUS KING — three hits fell it; until then, the way is barred
+// =============================================================
+const BOSS_W = 36, BOSS_H = 44;
+
+function updateBoss(dt, time) {
+  const b = world.boss, p = player;
+  if (!b || b.dead) return;
+  if (b.squash > 0) { // toppling
+    b.squash -= dt;
+    if (b.squash <= 0) { b.dead = true; cactusWin = { t: 0 }; }
+    return;
+  }
+  b.inv = Math.max(0, b.inv - dt);
+  b.x += b.dir * 26 * dt; // slow pace across the arena
+  if (b.x < b.minX) { b.x = b.minX; b.dir = 1; }
+  if (b.x > b.maxX) { b.x = b.maxX; b.dir = -1; }
+  if (transition || winState) return;
+  b.atk -= dt;
+  if (b.atk <= 0) { // a needle, aimed at your height
+    b.atk = 1.8;
+    const dir2 = p.x + CFG.playerW / 2 < b.x + BOSS_W / 2 ? -1 : 1;
+    world.needles.push({
+      x: b.x + BOSS_W / 2 + dir2 * 24,
+      y: Math.max(b.y + 6, Math.min(b.y + BOSS_H - 6, p.y + CFG.playerH / 2)),
+      vx: dir2 * 150, life: 4,
+    });
+  }
+  const overlap = p.x < b.x + BOSS_W && p.x + CFG.playerW > b.x &&
+                  p.y < b.y + BOSS_H && p.y + CFG.playerH > b.y;
+  if (!overlap || b.inv > 0) return; // grace frames cut both ways
+  if (p.vy > 60 && p.y + CFG.playerH < b.y + BOSS_H * 0.5) { // stomped its crown
+    bossHit(b);
+    p.vy = -260;
+  } else if (p.dashTimer > 0) { // dashed through its ribs
+    bossHit(b);
+  } else {
+    hazardDeath();
+  }
+}
+
+function bossHit(b) {
+  b.hp--;
+  b.inv = 0.9;
+  for (let i = 0; i < 12; i++) {
+    spawnParticle({ type: 'spore', hint: 0, x: b.x + Math.random() * BOSS_W, y: b.y + Math.random() * BOSS_H, vy: -20 - Math.random() * 30, phase: Math.random() * 6.3, size: 2, life: 0.9 });
+  }
+  if (b.hp <= 0) b.squash = 0.6;
+}
+
+function updateNeedles(dt) {
+  const p = player;
+  for (let i = world.needles.length - 1; i >= 0; i--) {
+    const n = world.needles[i];
+    n.x += n.vx * dt;
+    n.life -= dt;
+    if (n.life <= 0 || isSolid(Math.floor(n.x / T), Math.floor(n.y / T))) {
+      world.needles.splice(i, 1);
+      continue;
+    }
+    if (!transition && !winState &&
+        p.x < n.x + 8 && p.x + CFG.playerW > n.x - 8 &&
+        p.y < n.y + 2 && p.y + CFG.playerH > n.y - 2) {
+      world.needles.splice(i, 1);
+      hazardDeath();
+    }
+  }
+}
+
+function drawBoss(g, time, camIX, camIY) {
+  const b = world.boss;
+  if (b && !b.dead) {
+    const sx = Math.round(b.x - camIX), sy = Math.round(b.y - camIY);
+    if (sx > -60 && sx < CFG.VIEW_W + 60 && sy > -60 && sy < CFG.VIEW_H + 60) {
+      if (b.squash > 0) { // topples into a heap
+        g.globalAlpha = b.squash / 0.6;
+        g.fillStyle = '#2f5424';
+        g.fillRect(sx, sy + BOSS_H - 8, BOSS_W, 8);
+        g.globalAlpha = 1;
+      } else {
+        g.fillStyle = '#3f6b2f';                               // body
+        g.fillRect(sx, sy, BOSS_W, BOSS_H);
+        g.fillStyle = '#5c8f44';                               // ribs
+        g.fillRect(sx + 6, sy + 2, 4, BOSS_H - 2);
+        g.fillRect(sx + BOSS_W - 10, sy + 2, 4, BOSS_H - 2);
+        g.fillStyle = '#3f6b2f';                               // arms
+        g.fillRect(sx - 8, sy + 12, 8, 6);
+        g.fillRect(sx - 8, sy + 2, 6, 12);
+        g.fillRect(sx + BOSS_W, sy + 16, 8, 6);
+        g.fillRect(sx + BOSS_W + 2, sy + 6, 6, 12);
+        g.fillStyle = '#e8f2c4';                               // needles
+        g.fillRect(sx - 2, sy + 8, 2, 1);
+        g.fillRect(sx + BOSS_W, sy + 24, 2, 1);
+        g.fillStyle = '#ffd44a';                               // the crown
+        g.fillRect(sx + 6, sy - 4, BOSS_W - 12, 4);
+        g.fillRect(sx + 8, sy - 8, 4, 4);
+        g.fillRect(sx + 16, sy - 9, 4, 5);
+        g.fillRect(sx + 24, sy - 8, 4, 4);
+        const ex = b.dir > 0 ? 2 : 0;                          // angry eyes
+        g.fillStyle = '#ffffff';
+        g.fillRect(sx + 10, sy + 12, 5, 5);
+        g.fillRect(sx + 22, sy + 12, 5, 5);
+        g.fillStyle = '#1e3a16';
+        g.fillRect(sx + 11 + ex, sy + 14, 2, 3);
+        g.fillRect(sx + 23 + ex, sy + 14, 2, 3);
+        g.fillRect(sx + 9, sy + 10, 7, 2);                     // brows
+        g.fillRect(sx + 21, sy + 10, 7, 2);
+        if (b.inv > 0 && Math.sin(time * 30) > 0) {            // hit flash
+          g.globalAlpha = 0.5;
+          g.fillStyle = '#ffffff';
+          g.fillRect(sx, sy, BOSS_W, BOSS_H);
+          g.globalAlpha = 1;
+        }
+        for (let i = 0; i < b.hp; i++) {                       // health pips
+          g.fillStyle = '#b8e84a';
+          g.fillRect(sx + 4 + i * 10, sy - 16, 7, 5);
+        }
+      }
+    }
+  }
+  g.fillStyle = '#e8f2c4';
+  for (const n of world.needles) {
+    const nx = Math.round(n.x - camIX), ny = Math.round(n.y - camIY);
+    g.fillRect(nx - 6, ny - 1, 12, 2);
+  }
+}
+
+function drawSpikes(g, camIX, camIY) {
+  for (const s of world.spikes) {
+    const px = s.x * T - camIX, py = s.y * T - camIY;
+    if (px < -20 || px > CFG.VIEW_W + 20 || py < -20 || py > CFG.VIEW_H + 20) continue;
+    for (let k = 0; k < 3; k++) { // three needle pyramids per tile
+      const bx = px + 1 + k * 5;
+      g.fillStyle = '#2f5424';
+      g.fillRect(bx, py + 12, 5, 4);
+      g.fillStyle = '#4a7a38';
+      g.fillRect(bx + 1, py + 8, 3, 4);
+      g.fillStyle = '#e8f2c4';
+      g.fillRect(bx + 2, py + 5, 1, 3);
+    }
+  }
+}
+
+function doorRect(d, camIX, camIY) {
+  const px = d.x * T - camIX, py = (d.y - 2) * T - camIY; // top-left of the 2x3 opening
+  if (px < -80 || px > CFG.VIEW_W + 80 || py < -96 || py > CFG.VIEW_H + 96) return null;
+  return { px, py, w: 2 * T, h: 3 * T };
+}
+
+function drawDoorArch(g, r, inner) {
+  g.fillStyle = inner;
+  g.fillRect(r.px, r.py + 6, r.w, r.h - 6);
+  g.fillRect(r.px + 3, r.py + 2, r.w - 6, 4);
+}
+
+function drawEntranceFrame(g, camIX, camIY) {
+  for (const d of world.doors || []) {
+    const r = doorRect(d, camIX, camIY);
+    if (!r) continue;
+    const st = DOOR_STYLES[d.kind] || DOOR_STYLES.black;
+    const { px, py, w, h } = r;
+    if (d.kind === 'cactus') { // the great cactus: vast, purple-rimmed, hollow
+      const pulse = 0.55 + 0.45 * Math.sin(performance.now() / 350);
+      g.globalAlpha = pulse;
+      g.fillStyle = '#b06ce8';                       // purple outline
+      g.fillRect(px - 4, py - 16, w + 8, h + 16);
+      g.globalAlpha = 1;
+      g.fillStyle = '#3f6b2f';                       // body
+      g.fillRect(px - 2, py - 14, w + 4, h + 14);
+      g.fillStyle = '#5c8f44';                       // ribs
+      g.fillRect(px + 3, py - 12, 3, h + 12);
+      g.fillRect(px + w - 6, py - 12, 3, h + 12);
+      g.fillStyle = '#3f6b2f';                       // arms
+      g.fillRect(px - 10, py - 2, 8, 5);
+      g.fillRect(px - 10, py - 10, 5, 10);
+      g.fillRect(px + w + 2, py + 4, 8, 5);
+      g.fillRect(px + w + 5, py - 6, 5, 12);
+      g.fillStyle = '#e8f2c4';                       // needles
+      g.fillRect(px + 1, py - 8, 1, 2);
+      g.fillRect(px + w - 2, py - 4, 1, 2);
+      g.fillStyle = '#1e3a16';                       // the hollow
+      g.fillRect(px + 5, py + 10, w - 10, h - 10);
+      continue;
+    }
+    g.fillStyle = PAL.stoneDeep;                    // rock surround
+    g.fillRect(px - 4, py - 6, w + 8, h + 6);
+    g.fillStyle = PAL.topHi;                        // lintel highlight + moss
+    g.fillRect(px - 4, py - 6, w + 8, 2);
+    g.fillStyle = d.kind === 'grey' ? '#7a7a84' : PAL.mossA;
+    g.fillRect(px - 4, py - 5, w + 8, 3);
+    g.fillStyle = st.rim || PAL.doorRim;            // rim
+    g.fillRect(px - 1, py + 5, 1, h - 5);
+    g.fillRect(px + w, py + 5, 1, h - 5);
+    g.fillRect(px + 2, py + 1, w - 4, 1);
+    drawDoorArch(g, r, st.inner);
+    if (d.kind === 'grey') {                        // panel seams on the grey door
+      g.fillStyle = '#3f3f48';
+      g.fillRect(px + w / 2, py + 6, 1, h - 6);
+      g.fillRect(px + 3, py + h / 2, w - 6, 1);
+    }
+  }
+}
+
+// the black door's void swallows even the player's light — redrawn above the darkness
+function drawEntranceVoid(g, camIX, camIY) {
+  for (const d of world.doors || []) {
+    if (d.kind !== 'black') continue;
+    const r = doorRect(d, camIX, camIY);
+    if (r) drawDoorArch(g, r, '#000000');
+  }
+}
+
+// spores drift off glowing flora that's on screen
+function emitSpores(camIX, camIY) {
+  if (particles.length >= CFG.maxParticles - 20) return;
+  const x0 = Math.max(0, (camIX / T | 0) - 2);
+  const x1 = Math.min(W - 1, ((camIX + CFG.VIEW_W) / T | 0) + 2);
+  for (let x = x0; x <= x1; x++) {
+    for (const f of world.floraByCol[x]) {
+      if (!f.glow || Math.random() >= CFG.sporeChance) continue;
+      const fy = f.type === 'vine' ? f.y + f.len - 1 :
+                 f.type === 'bigvine' ? f.y + ((f.len / 2) | 0) : f.y;
+      // near the door, spores turn violet and drift toward it
+      let hint = 0;
+      const e = world.entrance;
+      if (e) {
+        const dd = Math.hypot(f.x - e.x, fy - e.y);
+        if (dd < CFG.hintRadius && dd > 3) hint = Math.sign(e.x - f.x);
+      }
+      spawnParticle({
+        type: 'spore', hint,
+        x: f.x * T + 4 + Math.random() * 8,
+        y: fy * T + 4 + Math.random() * 8,
+        vy: (PAL.sporeRise ? -1 : 1) * (6 + Math.random() * 6), // embers rise
+
+        phase: Math.random() * Math.PI * 2,
+        size: Math.random() < 0.5 ? 1 : 2,
+        life: 6 + Math.random() * 4,
+      });
+    }
+  }
+}
+
+// =============================================================
+// LIGHTING OVERLAY
+// =============================================================
+const LW = 64, LH = 38;
+const lightCanvas = document.createElement('canvas');
+lightCanvas.width = LW; lightCanvas.height = LH;
+const lightCtx = lightCanvas.getContext('2d');
+const lightData = lightCtx.createImageData(LW, LH);
+
+function drawLighting(g, camIX, camIY) {
+  const baseX = (camIX / T | 0) - 1;
+  const baseY = (camIY / T | 0) - 1;
+  const pcx = (player.x + CFG.playerW / 2) / T;
+  const pcy = (player.y + CFG.playerH / 2) / T;
+  const d = lightData.data;
+
+  for (let j = 0; j < LH; j++) {
+    const ty = baseY + j;
+    for (let i = 0; i < LW; i++) {
+      const tx = baseX + i;
+      let l = 0;
+      let solid = true;
+      if (tx >= 0 && tx < W && ty >= 0 && ty < H) {
+        l = world.staticLight[ty * W + tx];
+        solid = world.tiles[ty * W + tx] === STONE;
+      }
+      const dx = tx + 0.5 - pcx, dy = ty + 0.5 - pcy;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const pl = CFG.playerLight - dist * CFG.playerLightFalloff - (solid ? 2 : 0);
+      if (pl > l) l = pl;
+      if (l < (PAL.ambient || 0) && !solid) l = PAL.ambient; // daylight floor
+      if (l > 15) l = 15; else if (l < 0) l = 0;
+      const a = Math.pow(1 - l / 15, CFG.darknessExp) * (PAL.darkMax ?? CFG.darknessMax);
+      const o = (j * LW + i) * 4;
+      d[o] = PAL.darkR; d[o + 1] = 0; d[o + 2] = PAL.darkB; d[o + 3] = a;
+    }
+  }
+  lightCtx.putImageData(lightData, 0, 0);
+
+  g.imageSmoothingEnabled = true;
+  g.drawImage(lightCanvas, 0, 0, LW, LH,
+    baseX * T - camIX, baseY * T - camIY, LW * T, LH * T);
+  g.imageSmoothingEnabled = false;
+
+  // warm torch-glow around the player
+  const psx = player.x + CFG.playerW / 2 - camIX;
+  const psy = player.y + CFG.playerH / 2 - camIY;
+  const grad = g.createRadialGradient(psx, psy, 8, psx, psy, 110);
+  grad.addColorStop(0, 'rgba(255,233,196,0.07)');
+  grad.addColorStop(1, 'rgba(255,233,196,0)');
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = grad;
+  g.fillRect(psx - 110, psy - 110, 220, 220);
+  g.globalCompositeOperation = 'source-over';
+}
+
+// =============================================================
+// INPUT
+// =============================================================
+const keys = new Set();
+const justPressed = new Set();
+
+window.addEventListener('keydown', (e) => {
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) e.preventDefault();
+  if (!e.repeat) {
+    if (gameState === 'menu') {
+      if (menuScreen === 'help') {
+        if (['Space', 'Enter', 'Escape'].includes(e.code)) menuScreen = 'main';
+        return;
+      }
+      if (e.code === 'ArrowUp' || e.code === 'KeyW' || e.code === 'ArrowDown' || e.code === 'KeyS') {
+        menuIndex = (menuIndex + 1) % MENU_ITEMS.length;
+      } else if (e.code === 'Space' || e.code === 'Enter') {
+        if (menuIndex === 0) { startNewRun(); gameState = 'play'; }
+        else menuScreen = 'help';
+      }
+      return;
+    }
+    if (cactusWin) {
+      if (e.code === 'Space' || e.code === 'Enter') cactusWin = null;
+      return;
+    }
+    if (winState) {
+      if (e.code === 'Space' || e.code === 'Enter') startNewRun();
+      else if (e.code === 'Escape') { winState = null; gameState = 'menu'; menuScreen = 'main'; menuIndex = 0; }
+      return;
+    }
+    if (e.code === 'Escape') { // abandon the run, back to the menu
+      gameState = 'menu'; menuScreen = 'main'; menuIndex = 0;
+      transition = null; showMap = false;
+      keys.clear();
+      return;
+    }
+    justPressed.add(e.code);
+    if (e.code === 'KeyR' && !transition) {
+      levelSeeds[currentLevel] = (Math.random() * 0x7fffffff) | 0;
+      generateWorld(levelSeeds[currentLevel], currentLevel);
+      resetPlayer();
+      particles.length = 0;
+    }
+    if (e.code === 'Backquote') debugHud = !debugHud;
+    if (e.code === 'KeyM') showMap = !showMap;
+    if (e.code === 'KeyL') hatOn = !hatOn;
+  }
+  keys.add(e.code);
+});
+window.addEventListener('keyup', (e) => keys.delete(e.code));
+window.addEventListener('blur', () => keys.clear());
+
+// =============================================================
+// HUD
+// =============================================================
+let debugHud = false;
+let fps = 0, fpsFrames = 0, fpsTime = 0;
+
+function drawHud(g) {
+  g.font = '11px monospace';
+  g.textBaseline = 'top';
+  g.fillStyle = 'rgba(200,230,215,0.55)';
+  g.fillText(`${PAL.name.toLowerCase()} · seed ${world.seed}`, 8, 8);
+  g.fillText(fmtTime((performance.now() - runStart) / 1000), CFG.VIEW_W - 62, 8);
+  if (world.key) {
+    g.fillStyle = world.key.taken ? '#ffd44a' : 'rgba(200,230,215,0.45)';
+    g.fillText(world.key.taken ? 'key found' : 'the door needs a key', 8, 22);
+  }
+  if (doorMsg.t > 0) {
+    g.textAlign = 'center';
+    g.globalAlpha = Math.min(1, doorMsg.t / 0.4);
+    g.font = 'bold 15px monospace';
+    g.fillStyle = '#ffd44a';
+    g.fillText(doorMsg.text, CFG.VIEW_W / 2, 120);
+    g.globalAlpha = 1;
+    g.textAlign = 'left';
+    g.font = '11px monospace';
+  }
+  g.fillText('A/D move · Space jump · Shift dash · M map · L hat · R new cave · ` debug', 8, CFG.VIEW_H - 18);
+
+  if (debugHud) {
+    const tx = (player.x + CFG.playerW / 2) / T | 0;
+    const ty = (player.y + CFG.playerH / 2) / T | 0;
+    const l = (tx >= 0 && tx < W && ty >= 0 && ty < H) ? world.staticLight[ty * W + tx] : 0;
+    g.fillStyle = 'rgba(150,255,180,0.8)';
+    g.fillText(`fps ${fps}  tile ${tx},${ty}  light ${l}  particles ${particles.length}`, 8, 22);
+  }
+}
+
+// =============================================================
+// MAIN LOOP
+// =============================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+generateWorld(levelSeeds[1], 1);
+resetPlayer();
+
+let last = performance.now();
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, 1 / 30);
+  last = now;
+  const time = now / 1000;
+
+  // fps
+  fpsFrames++;
+  if (time - fpsTime >= 1) { fps = fpsFrames; fpsFrames = 0; fpsTime = time; }
+
+  // ---- update ----
+  if (gameState === 'menu') {
+    // slow drifting pan across the cave behind the menu
+    const t2 = time * 0.07;
+    cam.x = world.spawn.x * T - CFG.VIEW_W / 2 + Math.sin(t2) * 320;
+    cam.y = world.spawn.y * T - CFG.VIEW_H / 2 + Math.cos(t2 * 0.7) * 160;
+    clampCam();
+  } else if (cactusWin) {
+    cactusWin.t += dt; // the fall of the king holds the moment
+  } else if (!winState) {
+    if (!transition || transition.phase !== 'out') updatePlayer(dt);
+    updateWaterfall(dt);
+    updateVolcano(dt);
+    updateBombs(dt);
+    updateCrabs(dt, time);
+    updateHoppers(dt, time);
+    updateSpikes();
+    updateBoss(dt, time);
+    updateNeedles(dt);
+    updateKey(time);
+    doorMsg.t = Math.max(0, doorMsg.t - dt);
+    checkDoor();
+    updateTransition(dt);
+    updateCamera(dt);
+  }
+  const camIX = Math.round(cam.x), camIY = Math.round(cam.y);
+  updateParticles(dt, time, camIX, camIY);
+  emitSpores(camIX, camIY);
+
+  // ---- render ----
+  const g = ctx;
+
+  // 1. background gradient + parallax silhouettes
+  g.drawImage(bgCanvas, 0, 0);
+  const pox = -((camIX * 0.4) % CFG.VIEW_W), poy = -((camIY * 0.4) % CFG.VIEW_H);
+  g.globalAlpha = 0.6;
+  g.drawImage(blobCanvas, pox, poy);
+  g.drawImage(blobCanvas, pox + CFG.VIEW_W, poy);
+  g.drawImage(blobCanvas, pox, poy + CFG.VIEW_H);
+  g.drawImage(blobCanvas, pox + CFG.VIEW_W, poy + CFG.VIEW_H);
+  g.globalAlpha = 1;
+
+  // 2. terrain — one drawImage of the prebaked world
+  g.drawImage(world.terrainCanvas, camIX, camIY, CFG.VIEW_W, CFG.VIEW_H, 0, 0, CFG.VIEW_W, CFG.VIEW_H);
+
+  // 3. water animation: shimmering tint + displaced surface line
+  const wx0 = camIX / T | 0, wx1 = (camIX + CFG.VIEW_W) / T | 0;
+  const wy0 = camIY / T | 0, wy1 = (camIY + CFG.VIEW_H) / T | 0;
+  for (let ty = wy0; ty <= wy1; ty++) {
+    if (ty < 0 || ty >= H) continue;
+    for (let tx = wx0; tx <= wx1; tx++) {
+      if (tx < 0 || tx >= W || world.tiles[ty * W + tx] !== WATER) continue;
+      g.globalAlpha = 0.15 + 0.05 * Math.sin(time + tx);
+      g.fillStyle = PAL.waterTint;
+      g.fillRect(tx * T - camIX, ty * T - camIY, T, T);
+      if (ty > 0 && world.tiles[(ty - 1) * W + tx] === AIR) {
+        g.globalAlpha = 0.9;
+        g.fillStyle = PAL.waterLine;
+        const dy = Math.sin(time * 2 + tx * 0.8) * 1.5;
+        g.fillRect(tx * T - camIX, ty * T - camIY + dy, T, 2);
+      }
+    }
+  }
+  g.globalAlpha = 1;
+
+  // 3.5 the waterfall pours behind everything that moves
+  drawWaterfall(g, time, camIX, camIY);
+
+  // 4. entrance, then flora
+  drawEntranceFrame(g, camIX, camIY);
+  drawFlora(g, time, dt, camIX, camIY);
+
+  // 4.5 spikes, crabs and the king, then the player
+  drawSpikes(g, camIX, camIY);
+  drawCrabs(g, time, camIX, camIY);
+  drawHoppers(g, time, camIX, camIY);
+  drawBoss(g, time, camIX, camIY);
+
+  // 5. player
+  {
+    const sx = Math.round(player.x - camIX), sy = Math.round(player.y - camIY);
+    const bob = (player.moving && player.onGround) ? Math.sin(time * 14) * 1.5 : 0;
+    g.fillStyle = PAL.body;
+    g.fillRect(sx, sy, CFG.playerW, 14);                       // body
+    g.fillRect(sx + 1, sy + 14, 4, 8 + (bob > 0 ? -1 : 0));    // legs
+    g.fillRect(sx + 7, sy + 14, 4, 8 + (bob < 0 ? -1 : 0));
+    g.fillStyle = '#2b2b33';                                   // eyes
+    const ex = player.facing > 0 ? sx + 7 : sx + 3;
+    g.fillRect(ex, sy + 3, 2, 2);
+    if (player.hanging) {                                      // arm over the lip
+      g.fillStyle = PAL.body;
+      const ax = player.hangDir > 0 ? sx + CFG.playerW - 1 : sx - 3;
+      g.fillRect(ax, sy - 2, 4, 3);
+    }
+    if (hatOn) {                                               // the mushroom hat
+      const hb = Math.round(bob * 0.5);
+      g.fillStyle = PAL.stem;
+      g.fillRect(sx + 2, sy - 2 + hb, 8, 2);                   // brim seat
+      g.fillStyle = PAL.capA;
+      g.fillRect(sx - 1, sy - 5 + hb, 14, 3);                  // cap
+      g.fillRect(sx + 1, sy - 7 + hb, 10, 2);
+      g.fillStyle = '#ffffff55';                               // speckles
+      g.fillRect(sx + 3, sy - 6 + hb, 2, 1);
+      g.fillRect(sx + 8, sy - 4 + hb, 2, 1);
+    }
+    g.fillStyle = '#c9b382';                                   // belly shade
+    g.fillRect(sx, sy + 10, CFG.playerW, 2);
+  }
+
+  // 6. water-y particles (lit normally, under the darkness)
+  drawParticles(g, camIX, camIY, false);
+
+  // 7. lighting overlay + warm glow
+  drawLighting(g, camIX, camIY);
+
+  // 8. the entrance void swallows even the player's light; spores and the key glint above the dark
+  drawEntranceVoid(g, camIX, camIY);
+  drawKey(g, time, camIX, camIY);
+  drawBombs(g, camIX, camIY);
+  drawParticles(g, camIX, camIY, true);
+
+  // 9. HUD, lava warning/scorch, level transition fade
+  if (player.lavaTime > 0.3) { // rising red vignette while lava cooks you
+    const wa = Math.pow(player.lavaTime / CFG.lavaMaxTime, 2) * 0.4;
+    g.fillStyle = `rgba(255,60,10,${wa.toFixed(3)})`;
+    g.fillRect(0, 0, CFG.VIEW_W, CFG.VIEW_H);
+  }
+  if (scorchFlash > 0) {
+    scorchFlash = Math.max(0, scorchFlash - dt);
+    // fully red for the first beat, then a fading pulse
+    const a = scorchFlash > 0.6 ? 1 : Math.pow(scorchFlash / 0.6, 1.2);
+    g.fillStyle = `rgba(255,14,6,${a.toFixed(3)})`;
+    g.fillRect(0, 0, CFG.VIEW_W, CFG.VIEW_H);
+  }
+  if (gameState === 'menu') {
+    drawMenu(g, time);
+  } else {
+    drawHud(g);
+    drawMap(g, time);
+    drawCactusWin(g, time);
+    drawTransition(g);
+    drawWin(g, time);
+  }
+
+  justPressed.clear();
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
